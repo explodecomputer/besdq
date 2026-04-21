@@ -7,6 +7,8 @@ from typing import List, Dict
 
 from .besd_reader import BESDQueryEngine
 from .builder import BESDIndexBuilder
+from .sqlite_query import BESDQueryIndex
+
 
 
 def parse_chrpos(chrpos_str: str) -> tuple[str, int, int]:
@@ -82,10 +84,16 @@ def main():
     parser = argparse.ArgumentParser(
         description='Direct BESD query tool (SMR-compatible interface)'
     )
-    parser.add_argument('--beqtl-summary', required=True,
-                        help='Path to BESD files (without extension)')
+
+    # Input source: either BESD files or SQLite index
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--beqtl-summary',
+                        help='Path to BESD files (without extension) - reads from binary files')
+    input_group.add_argument('--besd-index',
+                        help='Path to SQLite index database file (created with --index) - reads from database')
+
     parser.add_argument('--index',
-                        help='Create SQLite index database at specified path (e.g. data/westra.db)')
+                        help='Create SQLite index database at specified path (e.g. data/westra.db). Requires --beqtl-summary.')
     parser.add_argument('--query', type=float, default=0.05,
                         help='P-value threshold for filtering results')
     parser.add_argument('--snp-chr',
@@ -119,9 +127,14 @@ def main():
 
     # Handle indexing mode
     if args.index:
+        if not args.beqtl_summary:
+            print("Error: --beqtl-summary is required when using --index", file=sys.stderr)
+            sys.exit(1)
         try:
+            print(f"Building SQLite index from BESD files: {args.beqtl_summary}")
             builder = BESDIndexBuilder(args.index)
             builder.build(args.beqtl_summary, force=False)
+            print(f"Index created: {args.index}")
             return
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -133,6 +146,16 @@ def main():
     if not args.out:
         print("Error: --out is required for query mode", file=sys.stderr)
         sys.exit(1)
+
+    # Determine data source
+    if args.besd_index:
+        print(f"Using SQLite index: {args.besd_index}")
+        query_engine = BESDQueryIndex(args.besd_index)
+        is_index = True
+    else:
+        print(f"Using BESD files: {args.beqtl_summary}")
+        query_engine = BESDQueryEngine(args.beqtl_summary)
+        is_index = False
 
     # Parse chrpos arguments if provided
     snp_chr = args.snp_chr
@@ -217,18 +240,23 @@ def main():
             sys.exit(1)
 
     try:
-        print(f"Loading BESD data from {args.beqtl_summary}...")
-        engine = BESDQueryEngine(args.beqtl_summary)
-
-        print(f"SNPs loaded: {len(engine.snps)}")
-        print(f"Probes loaded: {len(engine.probes)}")
-        print(f"Format: SPARSE_FILE_TYPE_{engine.besd.format_type}")
+        # Load metadata from appropriate source
+        if is_index:
+            print(f"Index metadata:")
+            print(f"  Format: SPARSE_FILE_TYPE_{query_engine.metadata['format_type']}")
+            print(f"  SNPs: {query_engine.metadata['n_snps']}")
+            print(f"  Probes: {query_engine.metadata['n_probes']}")
+        else:
+            print(f"\nBESD data loaded:")
+            print(f"  SNPs: {len(query_engine.snps)}")
+            print(f"  Probes: {len(query_engine.probes)}")
+            print(f"  Format: SPARSE_FILE_TYPE_{query_engine.besd.format_type}")
 
         print(f"\nQuerying cis-window:")
         print(f"  SNP:   {snp_chr}:{snp_start_kb*1000:.0f}-{snp_end_kb*1000:.0f} bp")
         print(f"  Probe: {probe_chr}:{probe_start_kb*1000:.0f}-{probe_end_kb*1000:.0f} bp")
 
-        associations = engine.query_cis_window(
+        associations = query_engine.query_cis_window(
             snp_chr=snp_chr,
             snp_start_kb=snp_start_kb,
             snp_end_kb=snp_end_kb,
@@ -247,6 +275,10 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        # Clean up database connection if using index
+        if is_index:
+            query_engine.close()
 
 
 if __name__ == '__main__':

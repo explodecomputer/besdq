@@ -2,8 +2,8 @@
 
 __version__ = "0.1.0"
 
-from .besd_reader import BESDReader, BESDQueryEngine, IndexReader
+from .besd_reader import BESDReader, IndexReader
+from .queries import BESDQueryEngine, BESDQueryIndex
 from .builder import BESDIndexBuilder
-from .query import BESDQueryIndex
 
-__all__ = ["BESDReader", "BESDQueryEngine", "IndexReader", "BESDIndexBuilder", "BESDQueryIndex"]
+__all__ = ["BESDReader", "IndexReader", "BESDQueryEngine", "BESDQueryIndex", "BESDIndexBuilder"]

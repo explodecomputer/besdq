@@ -6,6 +6,7 @@ from pathlib import Path
 from besdq import BESDQueryEngine, BESDIndexBuilder, BESDQueryIndex
 
 
+
 # Path to test data
 DATA_DIR = Path(__file__).parent.parent / "data"
 WESTRA_BESD = str(DATA_DIR / "westra_eqtl_hg19")

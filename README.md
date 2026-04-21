@@ -24,11 +24,27 @@ python3 -m besdq.cli --help
 
 ## Basic Usage
 
+### Two Query Options
+
+BESDQ supports querying data from two sources:
+
+1. **Direct BESD files** - `--beqtl-summary`
+   - Reads from binary `.besd`, `.esi`, `.epi` files directly
+   - No setup required, works immediately
+   - Suitable for one-time queries or exploratory analysis
+
+2. **SQLite index** - `--besd-index`
+   - Queries from an indexed SQLite database
+   - Requires one-time database creation (fast)
+   - Optimized for repeated queries and large-scale analysis
+   - 50-70% smaller than original BESD files
+
 ### Creating an SQLite Index Database
 
-For improved performance on repeated queries, create a SQLite index database:
+For improved performance on repeated queries, create a SQLite index database (one-time setup):
 
 ```bash
+# Create index from BESD files
 besdq --beqtl-summary data/westra_eqtl_hg19 --index data/westra_eqtl_hg19.db
 ```
 
@@ -37,50 +53,35 @@ This creates a database with:
 - Per-probe BLOBs storing numpy arrays of associations (snp_indices, betas, SEs)
 - Full metadata preservation from the original BESD files
 
-### Querying the SQLite Index
-
-Use the index database for fast queries in Python:
-
-```python
-from besdq import BESDQueryIndex
-
-# Open index
-with BESDQueryIndex('data/westra_eqtl_hg19.db') as index:
-    # Query by cis-window
-    assocs = index.query_cis_window(
-        snp_chr='1', snp_start_kb=100, snp_end_kb=2000,
-        probe_chr='1', probe_start_kb=1000, probe_end_kb=2000,
-    )
-    
-    # Query by probe ID
-    assocs = index.query_by_probe_id('ILMN_2349633')
-    
-    # Query by SNP ID
-    assocs = index.query_by_snp_id('rs3818646')
-```
-
 ### Command-line Interface
 
-Query a cis-window using chromosome and position ranges:
+#### Option 1: Query BESD Files Directly
 
 ```bash
-besdq \
-  --beqtl-summary data/westra_eqtl_hg19 \
-  --query 5e-4 \
-  --snp-chr 1 \
-  --from-snp-kb 100 \
-  --to-snp-kb 2000 \
-  --probe-chr 1 \
-  --from-probe-kb 1000 \
-  --to-probe-kb 2000 \
-  --out results/westra_1
+# Using chr:pos format (recommended)
+time besdq --beqtl-summary data/westra_eqtl_hg19 \
+  --snp-chrpos 1:100000-2000000 \
+  --probe-chrpos 1:1000000-2000000 \
+  --out results/output \
+  --query 1e-4
+```
+
+#### Option 2: Query SQLite Index (Faster for Repeated Queries)
+
+```bash
+# Using SQLite index
+time besdq --besd-index data/westra_eqtl_hg19.db \
+  --snp-chrpos 1:100000-2000000 \
+  --probe-chrpos 1:1000000-2000000 \
+  --out results/output \
+  --query 1e-4
 ```
 
 #### Coordinate Format Options
 
-You can specify positions in multiple ways:
+Both query modes support the same coordinate format options:
 
-**Kilobase format (default):**
+**Kilobase format:**
 ```bash
 besdq --beqtl-summary data/westra_eqtl_hg19 \
   --snp-chr 1 --from-snp-kb 100 --to-snp-kb 2000 \
@@ -98,13 +99,13 @@ besdq --beqtl-summary data/westra_eqtl_hg19 \
 
 **Chr:pos format (range or single position):**
 ```bash
-# Range
+# Range query
 besdq --beqtl-summary data/westra_eqtl_hg19 \
   --snp-chrpos 1:100000-2000000 \
   --probe-chrpos 1:1000000-2000000 \
   --out results/output
 
-# Single position
+# Single position query
 besdq --beqtl-summary data/westra_eqtl_hg19 \
   --snp-chrpos 1:1191870 \
   --probe-chrpos 1:1140818 \
@@ -113,9 +114,10 @@ besdq --beqtl-summary data/westra_eqtl_hg19 \
 
 #### P-value Filtering
 
-Filter results by p-value threshold (default: 0.05):
+Filter results by p-value threshold (applies to both query modes):
 
 ```bash
+# Query with p-value filter
 besdq --beqtl-summary data/westra_eqtl_hg19 \
   --snp-chrpos 1:100000-2000000 \
   --probe-chrpos 1:1000000-2000000 \
@@ -125,12 +127,14 @@ besdq --beqtl-summary data/westra_eqtl_hg19 \
 
 ### Python API
 
-Use the query engine directly in Python:
+BESDQ provides two query engines with identical interfaces:
+
+#### Option 1: Query BESD Files Directly
 
 ```python
 from besdq import BESDQueryEngine
 
-# Initialize
+# Initialize with BESD file prefix
 engine = BESDQueryEngine('data/westra_eqtl_hg19')
 
 # Query associations
@@ -143,6 +147,27 @@ associations = engine.query_cis_window(
 for assoc in associations:
     print(f"{assoc['snp_id']} - {assoc['probe_id']}: "
           f"beta={assoc['beta']:.4f}, p={assoc['pval']:.2e}")
+```
+
+#### Option 2: Query SQLite Index
+
+```python
+from besdq import BESDQueryIndex
+
+# Open index database (context manager handles connection)
+with BESDQueryIndex('data/westra_eqtl_hg19.db') as index:
+    # Query by cis-window (same interface as BESDQueryEngine)
+    associations = index.query_cis_window(
+        snp_chr='1', snp_start_kb=100, snp_end_kb=2000,
+        probe_chr='1', probe_start_kb=1000, probe_end_kb=2000,
+    )
+    
+    # Additional query methods for SQLite index
+    # Query all associations for a probe
+    assocs = index.query_by_probe_id('ILMN_2349633')
+    
+    # Query all associations for an SNP
+    assocs = index.query_by_snp_id('rs3818646')
 ```
 
 ## Output Format
