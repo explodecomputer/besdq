@@ -2,6 +2,10 @@
 
 Fast queries of BESD (Binary Efficient Sequential Data) eQTL summary statistics files without requiring a database. Supports both SPARSE_FILE_TYPE_3 and SPARSE_FILE_TYPE_3F formats and provides SMR-compatible command-line interface.
 
+## Credits
+
+This work builds on the BESD format designed and implemented in the [SMR software](https://yanglab.westlake.edu.cn/software/smr/#eQTLsummarydata) from [Jian Yang's group](https://yanglab.westlake.edu.cn/).
+
 ## Installation
 
 ### From GitHub (Recommended)
