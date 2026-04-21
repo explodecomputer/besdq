@@ -107,7 +107,7 @@ def main():
     parser.add_argument('--to-snp-bp', type=int,
                         help='SNP region end (bp)')
     parser.add_argument('--snp-chrpos',
-                        help='SNP region as chr:pos or chr:start-end (e.g. 1:1191870 or 1:100000-2000000)')
+                        help='SNP region as chr:pos or chr:start-end (e.g. 1:1191870 or 1:100000-2000000). Comma-separated for multiple ranges.')
     parser.add_argument('--probe-chr',
                         help='Probe chromosome')
     parser.add_argument('--from-probe-kb', type=float,
@@ -119,7 +119,7 @@ def main():
     parser.add_argument('--to-probe-bp', type=int,
                         help='Probe region end (bp)')
     parser.add_argument('--probe-chrpos',
-                        help='Probe region as chr:pos or chr:start-end (e.g. 1:1140818 or 1:1000000-2000000)')
+                        help='Probe region as chr:pos or chr:start-end (e.g. 1:1140818 or 1:1000000-2000000). Comma-separated for multiple ranges.')
     parser.add_argument('--snp',
                         help='SNP ID(s) to query (comma-separated for multiple, e.g. rs123,rs456)')
     parser.add_argument('--probe',
@@ -199,22 +199,20 @@ def main():
 
     else:
         # Cis-window query (original logic)
-        # Parse chrpos arguments if provided
-        snp_chr = args.snp_chr
-        snp_start_kb = None
-        snp_end_kb = None
-        probe_chr = args.probe_chr
-        probe_start_kb = None
-        probe_end_kb = None
+        # Handle comma-separated chrpos lists
+        snp_ranges = []
+        probe_ranges = []
 
         if args.snp_chrpos:
             if args.snp_chr or args.from_snp_kb or args.to_snp_kb or args.from_snp_bp or args.to_snp_bp:
                 print("Error: Cannot use --snp-chrpos with --snp-chr, --from-snp-kb, --to-snp-kb, --from-snp-bp, or --to-snp-bp", file=sys.stderr)
                 sys.exit(1)
+            # Split by comma and parse each range
             try:
-                snp_chr, start_bp, end_bp = parse_chrpos(args.snp_chrpos)
-                snp_start_kb = start_bp / 1000.0
-                snp_end_kb = end_bp / 1000.0
+                for chrpos in args.snp_chrpos.split(','):
+                    chrpos = chrpos.strip()
+                    snp_chr, start_bp, end_bp = parse_chrpos(chrpos)
+                    snp_ranges.append((snp_chr, start_bp / 1000.0, end_bp / 1000.0))
             except ValueError as e:
                 print(f"Error parsing --snp-chrpos: {e}", file=sys.stderr)
                 sys.exit(1)
@@ -223,16 +221,47 @@ def main():
             if args.probe_chr or args.from_probe_kb or args.to_probe_kb or args.from_probe_bp or args.to_probe_bp:
                 print("Error: Cannot use --probe-chrpos with --probe-chr, --from-probe-kb, --to-probe-kb, --from-probe-bp, or --to-probe-bp", file=sys.stderr)
                 sys.exit(1)
+            # Split by comma and parse each range
             try:
-                probe_chr, start_bp, end_bp = parse_chrpos(args.probe_chrpos)
-                probe_start_kb = start_bp / 1000.0
-                probe_end_kb = end_bp / 1000.0
+                for chrpos in args.probe_chrpos.split(','):
+                    chrpos = chrpos.strip()
+                    probe_chr, start_bp, end_bp = parse_chrpos(chrpos)
+                    probe_ranges.append((probe_chr, start_bp / 1000.0, end_bp / 1000.0))
             except ValueError as e:
                 print(f"Error parsing --probe-chrpos: {e}", file=sys.stderr)
                 sys.exit(1)
 
-        # Validate and convert SNP position arguments (if not using chrpos)
-        if snp_start_kb is None:
+        # If chrpos was used, combine results from all ranges
+        if snp_ranges or probe_ranges:
+            if not snp_ranges:
+                print("Error: Must specify both --snp-chrpos and --probe-chrpos together", file=sys.stderr)
+                sys.exit(1)
+            if not probe_ranges:
+                print("Error: Must specify both --snp-chrpos and --probe-chrpos together", file=sys.stderr)
+                sys.exit(1)
+
+            associations = []
+            for snp_chr, snp_start_kb, snp_end_kb in snp_ranges:
+                for probe_chr, probe_start_kb, probe_end_kb in probe_ranges:
+                    print(f"Querying SNP {snp_chr}:{snp_start_kb*1000:.0f}-{snp_end_kb*1000:.0f} bp, Probe {probe_chr}:{probe_start_kb*1000:.0f}-{probe_end_kb*1000:.0f} bp")
+                    range_assocs = query_engine.query_cis_window(
+                        snp_chr=snp_chr,
+                        snp_start_kb=snp_start_kb,
+                        snp_end_kb=snp_end_kb,
+                        probe_chr=probe_chr,
+                        probe_start_kb=probe_start_kb,
+                        probe_end_kb=probe_end_kb,
+                    )
+                    associations.extend(range_assocs)
+        else:
+            # Standard range query (not using chrpos)
+            snp_chr = args.snp_chr
+            snp_start_kb = None
+            snp_end_kb = None
+            probe_chr = args.probe_chr
+            probe_start_kb = None
+            probe_end_kb = None
+
             if args.from_snp_kb is not None and args.from_snp_bp is not None:
                 print("Error: Cannot specify both --from-snp-kb and --from-snp-bp", file=sys.stderr)
                 sys.exit(1)
@@ -256,8 +285,7 @@ def main():
                 print("Error: Must specify either --snp-chrpos, --to-snp-kb, or --to-snp-bp", file=sys.stderr)
                 sys.exit(1)
 
-        # Validate and convert probe position arguments (if not using chrpos)
-        if probe_start_kb is None:
+            # Validate and convert probe position arguments
             if args.from_probe_kb is not None and args.from_probe_bp is not None:
                 print("Error: Cannot specify both --from-probe-kb and --from-probe-bp", file=sys.stderr)
                 sys.exit(1)
@@ -281,18 +309,18 @@ def main():
                 print("Error: Must specify either --probe-chrpos, --to-probe-kb, or --to-probe-bp", file=sys.stderr)
                 sys.exit(1)
 
-        print(f"Querying cis-window:")
-        print(f"  SNP:   {snp_chr}:{snp_start_kb*1000:.0f}-{snp_end_kb*1000:.0f} bp")
-        print(f"  Probe: {probe_chr}:{probe_start_kb*1000:.0f}-{probe_end_kb*1000:.0f} bp")
+            print(f"Querying cis-window:")
+            print(f"  SNP:   {snp_chr}:{snp_start_kb*1000:.0f}-{snp_end_kb*1000:.0f} bp")
+            print(f"  Probe: {probe_chr}:{probe_start_kb*1000:.0f}-{probe_end_kb*1000:.0f} bp")
 
-        associations = query_engine.query_cis_window(
-            snp_chr=snp_chr,
-            snp_start_kb=snp_start_kb,
-            snp_end_kb=snp_end_kb,
-            probe_chr=probe_chr,
-            probe_start_kb=probe_start_kb,
-            probe_end_kb=probe_end_kb,
-        )
+            associations = query_engine.query_cis_window(
+                snp_chr=snp_chr,
+                snp_start_kb=snp_start_kb,
+                snp_end_kb=snp_end_kb,
+                probe_chr=probe_chr,
+                probe_start_kb=probe_start_kb,
+                probe_end_kb=probe_end_kb,
+            )
 
     try:
         print(f"\nFound {len(associations)} associations")

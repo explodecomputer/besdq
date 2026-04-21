@@ -140,8 +140,40 @@ class TestBESDQueryEngine(unittest.TestCase):
         )
         self.assertEqual(len(associations), 0)
 
+    def test_multi_snp_query(self):
+        """Test querying multiple SNPs."""
+        # Test query_by_snp_id with multiple SNPs
+        assocs1 = self.engine.query_by_snp_id('rs3818646')
+        assocs2 = self.engine.query_by_snp_id('rs7515488')
 
-class TestBESDQueryIndex(unittest.TestCase):
+        self.assertEqual(len(assocs1), 5)
+        self.assertEqual(len(assocs2), 6)
+
+        # Combined
+        combined = assocs1 + assocs2
+        self.assertEqual(len(combined), 11)
+
+    def test_multi_probe_query(self):
+        """Test querying multiple probes."""
+        # Test query_by_probe_id with multiple probes
+        assocs1 = self.engine.query_by_probe_id('ILMN_2349633')
+        assocs2 = self.engine.query_by_probe_id('ILMN_2112256')
+
+        self.assertEqual(len(assocs1), 20)
+        self.assertEqual(len(assocs2), 20)
+
+        # Check they're different probes
+        probe_ids = {a['probe_id'] for a in assocs1 + assocs2}
+        self.assertEqual(len(probe_ids), 2)
+
+    def test_gene_query(self):
+        """Test querying by gene name."""
+        associations = self.engine.query_by_gene('TNFRSF18')
+        self.assertEqual(len(associations), 20)
+
+        # All results should be for the same gene
+        for assoc in associations:
+            self.assertEqual(assoc['gene'], 'TNFRSF18')
     """Test SQLite-indexed BESD query engine."""
 
     @classmethod
@@ -232,6 +264,74 @@ class TestBESDQueryIndex(unittest.TestCase):
         self.assertEqual(besd_results[0]['probe_id'], index_results[0]['probe_id'])
         self.assertAlmostEqual(besd_results[0]['beta'], index_results[0]['beta'], places=5)
         self.assertAlmostEqual(besd_results[0]['se'], index_results[0]['se'], places=5)
+
+    def test_multi_snp_query_index(self):
+        """Test querying multiple SNPs from index."""
+        assocs1 = self.index.query_by_snp_id('rs3818646')
+        assocs2 = self.index.query_by_snp_id('rs7515488')
+
+        self.assertEqual(len(assocs1), 5)
+        self.assertEqual(len(assocs2), 6)
+
+    def test_multi_probe_query_index(self):
+        """Test querying multiple probes from index."""
+        assocs1 = self.index.query_by_probe_id('ILMN_2349633')
+        assocs2 = self.index.query_by_probe_id('ILMN_2112256')
+
+        self.assertEqual(len(assocs1), 20)
+        self.assertEqual(len(assocs2), 20)
+
+        # Check they're different probes
+        probe_ids = {a['probe_id'] for a in assocs1 + assocs2}
+        self.assertEqual(len(probe_ids), 2)
+
+    def test_gene_query_index(self):
+        """Test querying by gene name from index."""
+        associations = self.index.query_by_gene('TNFRSF18')
+        self.assertEqual(len(associations), 20)
+
+        # All results should be for the same gene
+        for assoc in associations:
+            self.assertEqual(assoc['gene'], 'TNFRSF18')
+
+    def test_consistency_snp_query(self):
+        """Test that SNP queries are consistent between BESD and index."""
+        engine = BESDQueryEngine(WESTRA_BESD)
+
+        besd_results = engine.query_by_snp_id('rs3818646')
+        index_results = self.index.query_by_snp_id('rs3818646')
+
+        self.assertEqual(len(besd_results), len(index_results))
+        # Check same associations returned
+        besd_assoc_ids = {(a['snp_id'], a['probe_id']) for a in besd_results}
+        index_assoc_ids = {(a['snp_id'], a['probe_id']) for a in index_results}
+        self.assertEqual(besd_assoc_ids, index_assoc_ids)
+
+    def test_consistency_probe_query(self):
+        """Test that probe queries are consistent between BESD and index."""
+        engine = BESDQueryEngine(WESTRA_BESD)
+
+        besd_results = engine.query_by_probe_id('ILMN_2349633')
+        index_results = self.index.query_by_probe_id('ILMN_2349633')
+
+        self.assertEqual(len(besd_results), len(index_results))
+        # Check same associations returned
+        besd_assoc_ids = {(a['snp_id'], a['probe_id']) for a in besd_results}
+        index_assoc_ids = {(a['snp_id'], a['probe_id']) for a in index_results}
+        self.assertEqual(besd_assoc_ids, index_assoc_ids)
+
+    def test_consistency_gene_query(self):
+        """Test that gene queries are consistent between BESD and index."""
+        engine = BESDQueryEngine(WESTRA_BESD)
+
+        besd_results = engine.query_by_gene('TNFRSF18')
+        index_results = self.index.query_by_gene('TNFRSF18')
+
+        self.assertEqual(len(besd_results), len(index_results))
+        # Check same associations returned
+        besd_assoc_ids = {(a['snp_id'], a['probe_id']) for a in besd_results}
+        index_assoc_ids = {(a['snp_id'], a['probe_id']) for a in index_results}
+        self.assertEqual(besd_assoc_ids, index_assoc_ids)
 
 
 if __name__ == '__main__':
