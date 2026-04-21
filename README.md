@@ -4,15 +4,21 @@ Fast queries of BESD (Binary Efficient Sequential Data) eQTL summary statistics 
 
 ## Installation
 
-### From source
+### From GitHub (Recommended)
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/explodecomputer/besdq.git
 cd besdq
 pip install -e .
 ```
 
 This installs the package in development mode with the `besdq` command-line tool.
+
+### From PyPI (when available)
+
+```bash
+pip install besdq
+```
 
 ### Running without installation
 
@@ -21,6 +27,21 @@ You can also run the CLI directly without installing:
 ```bash
 python3 -m besdq.cli --help
 ```
+
+## Dependencies
+
+**Required:**
+- Python 3.9+
+- numpy>=1.20 (for efficient array storage in database indices)
+
+**Development (optional):**
+- black>=22.0 (code formatting)
+- flake8>=4.0 (linting)
+
+## System Requirements
+
+- ~1GB free disk space per BESD dataset
+- ~50-70% additional space for SQLite index databases (optional but recommended)
 
 ## Basic Usage
 
@@ -234,12 +255,6 @@ BESDQ expects three files with a common prefix:
 - `.besd` - Binary BESD file with association statistics
 - `.esi` - SNP index file (chr, rsid, genetic_distance, bp, allele1, allele2, frequency)
 - `.epi` - Probe index file (chr, probe_id, genetic_distance, probe_bp, gene, orientation)
-
-## Requirements
-
-- Python 3.9+
-- numpy (for efficient array storage in database indices)
-- No external dependencies for core query functionality when not using database indices
 
 ## License
 
