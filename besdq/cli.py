@@ -120,6 +120,12 @@ def main():
                         help='Probe region end (bp)')
     parser.add_argument('--probe-chrpos',
                         help='Probe region as chr:pos or chr:start-end (e.g. 1:1140818 or 1:1000000-2000000)')
+    parser.add_argument('--snp',
+                        help='SNP ID(s) to query (comma-separated for multiple, e.g. rs123,rs456)')
+    parser.add_argument('--probe',
+                        help='Probe ID(s) to query (comma-separated for multiple)')
+    parser.add_argument('--gene',
+                        help='Gene name(s) to query (comma-separated for multiple)')
     parser.add_argument('--out',
                         help='Output file prefix')
 
@@ -157,102 +163,125 @@ def main():
         query_engine = BESDQueryEngine(args.beqtl_summary)
         is_index = False
 
-    # Parse chrpos arguments if provided
-    snp_chr = args.snp_chr
-    snp_start_kb = None
-    snp_end_kb = None
-    probe_chr = args.probe_chr
-    probe_start_kb = None
-    probe_end_kb = None
+    # Determine query type and validate arguments
+    has_snp_query = args.snp or args.snp_chrpos or args.snp_chr or args.from_snp_kb or args.to_snp_kb or args.from_snp_bp or args.to_snp_bp
+    has_probe_query = args.probe or args.probe_chrpos or args.probe_chr or args.from_probe_kb or args.to_probe_kb or args.from_probe_bp or args.to_probe_bp or args.gene
 
-    if args.snp_chrpos:
-        if args.snp_chr or args.from_snp_kb or args.to_snp_kb or args.from_snp_bp or args.to_snp_bp:
-            print("Error: Cannot use --snp-chrpos with --snp-chr, --from-snp-kb, --to-snp-kb, --from-snp-bp, or --to-snp-bp", file=sys.stderr)
-            sys.exit(1)
-        try:
-            snp_chr, start_bp, end_bp = parse_chrpos(args.snp_chrpos)
-            snp_start_kb = start_bp / 1000.0
-            snp_end_kb = end_bp / 1000.0
-        except ValueError as e:
-            print(f"Error parsing --snp-chrpos: {e}", file=sys.stderr)
-            sys.exit(1)
+    if args.snp:
+        # Query by SNP ID(s)
+        snp_ids = [s.strip() for s in args.snp.split(',')]
+        print(f"Querying {len(snp_ids)} SNP(s)...")
+        associations = []
+        for snp_id in snp_ids:
+            assocs = query_engine.query_by_snp_id(snp_id)
+            associations.extend(assocs)
+            print(f"  {snp_id}: {len(assocs)} associations")
 
-    if args.probe_chrpos:
-        if args.probe_chr or args.from_probe_kb or args.to_probe_kb or args.from_probe_bp or args.to_probe_bp:
-            print("Error: Cannot use --probe-chrpos with --probe-chr, --from-probe-kb, --to-probe-kb, --from-probe-bp, or --to-probe-bp", file=sys.stderr)
-            sys.exit(1)
-        try:
-            probe_chr, start_bp, end_bp = parse_chrpos(args.probe_chrpos)
-            probe_start_kb = start_bp / 1000.0
-            probe_end_kb = end_bp / 1000.0
-        except ValueError as e:
-            print(f"Error parsing --probe-chrpos: {e}", file=sys.stderr)
-            sys.exit(1)
+    elif args.probe:
+        # Query by probe ID(s)
+        probe_ids = [p.strip() for p in args.probe.split(',')]
+        print(f"Querying {len(probe_ids)} probe(s)...")
+        associations = []
+        for probe_id in probe_ids:
+            assocs = query_engine.query_by_probe_id(probe_id)
+            associations.extend(assocs)
+            print(f"  {probe_id}: {len(assocs)} associations")
 
-    # Validate and convert SNP position arguments (if not using chrpos)
-    if snp_start_kb is None:
-        if args.from_snp_kb is not None and args.from_snp_bp is not None:
-            print("Error: Cannot specify both --from-snp-kb and --from-snp-bp", file=sys.stderr)
-            sys.exit(1)
-        if args.to_snp_kb is not None and args.to_snp_bp is not None:
-            print("Error: Cannot specify both --to-snp-kb and --to-snp-bp", file=sys.stderr)
-            sys.exit(1)
+    elif args.gene:
+        # Query by gene name(s)
+        genes = [g.strip() for g in args.gene.split(',')]
+        print(f"Querying {len(genes)} gene(s)...")
+        associations = []
+        for gene_name in genes:
+            assocs = query_engine.query_by_gene(gene_name)
+            associations.extend(assocs)
+            print(f"  {gene_name}: {len(assocs)} associations")
 
-        if args.from_snp_bp is not None:
-            snp_start_kb = args.from_snp_bp / 1000.0
-        elif args.from_snp_kb is not None:
-            snp_start_kb = args.from_snp_kb
-        else:
-            print("Error: Must specify either --snp-chrpos, --from-snp-kb, or --from-snp-bp", file=sys.stderr)
-            sys.exit(1)
+    else:
+        # Cis-window query (original logic)
+        # Parse chrpos arguments if provided
+        snp_chr = args.snp_chr
+        snp_start_kb = None
+        snp_end_kb = None
+        probe_chr = args.probe_chr
+        probe_start_kb = None
+        probe_end_kb = None
 
-        if args.to_snp_bp is not None:
-            snp_end_kb = args.to_snp_bp / 1000.0
-        elif args.to_snp_kb is not None:
-            snp_end_kb = args.to_snp_kb
-        else:
-            print("Error: Must specify either --snp-chrpos, --to-snp-kb, or --to-snp-bp", file=sys.stderr)
-            sys.exit(1)
+        if args.snp_chrpos:
+            if args.snp_chr or args.from_snp_kb or args.to_snp_kb or args.from_snp_bp or args.to_snp_bp:
+                print("Error: Cannot use --snp-chrpos with --snp-chr, --from-snp-kb, --to-snp-kb, --from-snp-bp, or --to-snp-bp", file=sys.stderr)
+                sys.exit(1)
+            try:
+                snp_chr, start_bp, end_bp = parse_chrpos(args.snp_chrpos)
+                snp_start_kb = start_bp / 1000.0
+                snp_end_kb = end_bp / 1000.0
+            except ValueError as e:
+                print(f"Error parsing --snp-chrpos: {e}", file=sys.stderr)
+                sys.exit(1)
 
-    # Validate and convert probe position arguments (if not using chrpos)
-    if probe_start_kb is None:
-        if args.from_probe_kb is not None and args.from_probe_bp is not None:
-            print("Error: Cannot specify both --from-probe-kb and --from-probe-bp", file=sys.stderr)
-            sys.exit(1)
-        if args.to_probe_kb is not None and args.to_probe_bp is not None:
-            print("Error: Cannot specify both --to-probe-kb and --to-probe-bp", file=sys.stderr)
-            sys.exit(1)
+        if args.probe_chrpos:
+            if args.probe_chr or args.from_probe_kb or args.to_probe_kb or args.from_probe_bp or args.to_probe_bp:
+                print("Error: Cannot use --probe-chrpos with --probe-chr, --from-probe-kb, --to-probe-kb, --from-probe-bp, or --to-probe-bp", file=sys.stderr)
+                sys.exit(1)
+            try:
+                probe_chr, start_bp, end_bp = parse_chrpos(args.probe_chrpos)
+                probe_start_kb = start_bp / 1000.0
+                probe_end_kb = end_bp / 1000.0
+            except ValueError as e:
+                print(f"Error parsing --probe-chrpos: {e}", file=sys.stderr)
+                sys.exit(1)
 
-        if args.from_probe_bp is not None:
-            probe_start_kb = args.from_probe_bp / 1000.0
-        elif args.from_probe_kb is not None:
-            probe_start_kb = args.from_probe_kb
-        else:
-            print("Error: Must specify either --probe-chrpos, --from-probe-kb, or --from-probe-bp", file=sys.stderr)
-            sys.exit(1)
+        # Validate and convert SNP position arguments (if not using chrpos)
+        if snp_start_kb is None:
+            if args.from_snp_kb is not None and args.from_snp_bp is not None:
+                print("Error: Cannot specify both --from-snp-kb and --from-snp-bp", file=sys.stderr)
+                sys.exit(1)
+            if args.to_snp_kb is not None and args.to_snp_bp is not None:
+                print("Error: Cannot specify both --to-snp-kb and --to-snp-bp", file=sys.stderr)
+                sys.exit(1)
 
-        if args.to_probe_bp is not None:
-            probe_end_kb = args.to_probe_bp / 1000.0
-        elif args.to_probe_kb is not None:
-            probe_end_kb = args.to_probe_kb
-        else:
-            print("Error: Must specify either --probe-chrpos, --to-probe-kb, or --to-probe-bp", file=sys.stderr)
-            sys.exit(1)
+            if args.from_snp_bp is not None:
+                snp_start_kb = args.from_snp_bp / 1000.0
+            elif args.from_snp_kb is not None:
+                snp_start_kb = args.from_snp_kb
+            else:
+                print("Error: Must specify either --snp-chrpos, --from-snp-kb, or --from-snp-bp", file=sys.stderr)
+                sys.exit(1)
 
-    try:
-        # Load metadata from appropriate source
-        if is_index:
-            print(f"Index metadata:")
-            print(f"  Format: SPARSE_FILE_TYPE_{query_engine.metadata['format_type']}")
-            print(f"  SNPs: {query_engine.metadata['n_snps']}")
-            print(f"  Probes: {query_engine.metadata['n_probes']}")
-        else:
-            print(f"\nBESD data loaded:")
-            print(f"  SNPs: {len(query_engine.snps)}")
-            print(f"  Probes: {len(query_engine.probes)}")
-            print(f"  Format: SPARSE_FILE_TYPE_{query_engine.besd.format_type}")
+            if args.to_snp_bp is not None:
+                snp_end_kb = args.to_snp_bp / 1000.0
+            elif args.to_snp_kb is not None:
+                snp_end_kb = args.to_snp_kb
+            else:
+                print("Error: Must specify either --snp-chrpos, --to-snp-kb, or --to-snp-bp", file=sys.stderr)
+                sys.exit(1)
 
-        print(f"\nQuerying cis-window:")
+        # Validate and convert probe position arguments (if not using chrpos)
+        if probe_start_kb is None:
+            if args.from_probe_kb is not None and args.from_probe_bp is not None:
+                print("Error: Cannot specify both --from-probe-kb and --from-probe-bp", file=sys.stderr)
+                sys.exit(1)
+            if args.to_probe_kb is not None and args.to_probe_bp is not None:
+                print("Error: Cannot specify both --to-probe-kb and --to-probe-bp", file=sys.stderr)
+                sys.exit(1)
+
+            if args.from_probe_bp is not None:
+                probe_start_kb = args.from_probe_bp / 1000.0
+            elif args.from_probe_kb is not None:
+                probe_start_kb = args.from_probe_kb
+            else:
+                print("Error: Must specify either --probe-chrpos, --from-probe-kb, or --from-probe-bp", file=sys.stderr)
+                sys.exit(1)
+
+            if args.to_probe_bp is not None:
+                probe_end_kb = args.to_probe_bp / 1000.0
+            elif args.to_probe_kb is not None:
+                probe_end_kb = args.to_probe_kb
+            else:
+                print("Error: Must specify either --probe-chrpos, --to-probe-kb, or --to-probe-bp", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"Querying cis-window:")
         print(f"  SNP:   {snp_chr}:{snp_start_kb*1000:.0f}-{snp_end_kb*1000:.0f} bp")
         print(f"  Probe: {probe_chr}:{probe_start_kb*1000:.0f}-{probe_end_kb*1000:.0f} bp")
 
@@ -265,6 +294,7 @@ def main():
             probe_end_kb=probe_end_kb,
         )
 
+    try:
         print(f"\nFound {len(associations)} associations")
 
         if associations:
@@ -279,6 +309,7 @@ def main():
         # Clean up database connection if using index
         if is_index:
             query_engine.close()
+
 
 
 if __name__ == '__main__':

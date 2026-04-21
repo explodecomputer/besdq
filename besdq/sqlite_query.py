@@ -278,6 +278,7 @@ class BESDQueryIndex:
 
         return associations
 
+
     def query_by_snp_id(self, snp_id: str) -> List[Dict]:
         """Query all associations for a specific SNP.
 
@@ -348,5 +349,76 @@ class BESDQueryIndex:
                     'se': se,
                     'pval': pval,
                 })
+
+        return associations
+
+
+    def query_by_gene(self, gene_name: str) -> List[Dict]:
+        """Query all associations for a specific gene.
+
+        Args:
+            gene_name: Gene name to query
+
+        Returns:
+            List of associations for the gene
+        """
+        cursor = self.conn.cursor()
+
+        # Find all probes for this gene
+        cursor.execute("""
+            SELECT row_idx, chr, probe_id, probe_bp, gene
+            FROM epi
+            WHERE gene = ?
+        """, (gene_name,))
+
+        probes = [dict(row) for row in cursor.fetchall()]
+        if not probes:
+            return []
+
+        associations = []
+        for probe in probes:
+            probe_idx = probe['row_idx']
+            snp_indices, betas, ses = self.get_probe_snps(probe_idx)
+
+            # Get SNP metadata for all SNPs in this probe
+            if len(snp_indices) > 0:
+                snp_indices_list = [int(idx) for idx in snp_indices]
+                placeholders = ','.join('?' * len(snp_indices_list))
+                cursor.execute(f"""
+                    SELECT row_idx, snp_id, chr, bp, a1, a2
+                    FROM esi
+                    WHERE row_idx IN ({placeholders})
+                """, snp_indices_list)
+
+                snp_by_idx = {row['row_idx']: dict(row) for row in cursor.fetchall()}
+
+                # Build results
+                for i, snp_idx in enumerate(snp_indices):
+                    snp_idx_int = int(snp_idx)
+                    if snp_idx_int in snp_by_idx:
+                        snp = snp_by_idx[snp_idx_int]
+                        beta = float(betas[i])
+                        se = float(ses[i])
+
+                        if se > 0:
+                            z_score = abs(beta / se)
+                            pval = 2 * (1 - norm_cdf(z_score))
+                        else:
+                            pval = 1.0
+
+                        associations.append({
+                            'snp_id': snp['snp_id'],
+                            'snp_chr': snp['chr'],
+                            'snp_bp': snp['bp'],
+                            'a1': snp['a1'],
+                            'a2': snp['a2'],
+                            'probe_id': probe['probe_id'],
+                            'probe_chr': probe['chr'],
+                            'probe_bp': probe['probe_bp'],
+                            'gene': probe['gene'],
+                            'beta': beta,
+                            'se': se,
+                            'pval': pval,
+                        })
 
         return associations
