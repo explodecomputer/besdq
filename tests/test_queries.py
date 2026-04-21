@@ -3,7 +3,13 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest import mock
+import io
+import contextlib
 from besdq import BESDQueryEngine, BESDIndexBuilder, BESDQueryIndex
+from besdq.besd_reader import IndexReader, calculate_p_value as reader_calculate_p_value
+from besdq.sqlite_query import calculate_p_value as sqlite_calculate_p_value
+from besdq import cli
 
 
 
@@ -335,6 +341,119 @@ class TestBESDQueryIndex(unittest.TestCase):
         besd_assoc_ids = {(a['snp_id'], a['probe_id']) for a in besd_results}
         index_assoc_ids = {(a['snp_id'], a['probe_id']) for a in index_results}
         self.assertEqual(besd_assoc_ids, index_assoc_ids)
+
+
+class TestIndexReaderParsing(unittest.TestCase):
+    """Test index file parsing edge cases."""
+
+    def test_read_esi_row_idx_ignores_non_data_lines(self):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.esi', delete=False) as f:
+            f.write("# comment\n")
+            f.write("\n")
+            f.write("1 rsA 0.1 100 A G 0.4\n")
+            f.write("bad line\n")
+            f.write("1 rsB 0.2 200 C T 0.2\n")
+            esi_path = f.name
+
+        try:
+            snps = IndexReader.read_esi(esi_path)
+            self.assertEqual(len(snps), 2)
+            self.assertEqual(snps[0]['row_idx'], 0)
+            self.assertEqual(snps[1]['row_idx'], 1)
+            self.assertEqual(snps[0]['snp_id'], 'rsA')
+            self.assertEqual(snps[1]['snp_id'], 'rsB')
+        finally:
+            Path(esi_path).unlink()
+
+    def test_read_epi_row_idx_ignores_non_data_lines(self):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.epi', delete=False) as f:
+            f.write("# comment\n")
+            f.write("1 probeA 0.0 1000 GENE1 +\n")
+            f.write("\n")
+            f.write("bad line\n")
+            f.write("1 probeB 0.0 2000 GENE2 -\n")
+            epi_path = f.name
+
+        try:
+            probes = IndexReader.read_epi(epi_path)
+            self.assertEqual(len(probes), 2)
+            self.assertEqual(probes[0]['row_idx'], 0)
+            self.assertEqual(probes[1]['row_idx'], 1)
+            self.assertEqual(probes[0]['probe_id'], 'probeA')
+            self.assertEqual(probes[1]['probe_id'], 'probeB')
+        finally:
+            Path(epi_path).unlink()
+
+
+class TestPValueEdgeCases(unittest.TestCase):
+    """Test numeric stability of p-value computations."""
+
+    def test_p_value_extreme_z_is_bounded_reader(self):
+        pval = reader_calculate_p_value(beta=1e9, se=1e-12)
+        self.assertGreaterEqual(pval, 0.0)
+        self.assertLessEqual(pval, 1.0)
+
+    def test_p_value_extreme_z_is_bounded_sqlite(self):
+        pval = sqlite_calculate_p_value(beta=1e9, se=1e-12)
+        self.assertGreaterEqual(pval, 0.0)
+        self.assertLessEqual(pval, 1.0)
+
+    def test_p_value_zero_or_negative_se_defaults_to_one(self):
+        self.assertEqual(reader_calculate_p_value(beta=1.0, se=0.0), 1.0)
+        self.assertEqual(reader_calculate_p_value(beta=1.0, se=-1.0), 1.0)
+        self.assertEqual(sqlite_calculate_p_value(beta=1.0, se=0.0), 1.0)
+        self.assertEqual(sqlite_calculate_p_value(beta=1.0, se=-1.0), 1.0)
+
+
+class TestCLIValidation(unittest.TestCase):
+    """Test CLI parsing and argument validation edge cases."""
+
+    def test_parse_chrpos_reversed_range_raises(self):
+        with self.assertRaises(ValueError):
+            cli.parse_chrpos("1:200-100")
+
+    def test_parse_chrpos_malformed_position_raises(self):
+        with self.assertRaises(ValueError):
+            cli.parse_chrpos("1:abc")
+
+    def test_cli_rejects_conflicting_identifier_queries(self):
+        test_argv = [
+            "besdq",
+            "--beqtl-summary", "dummy",
+            "--out", "out",
+            "--snp", "rs1",
+            "--probe", "probe1",
+        ]
+        with (
+            mock.patch("sys.argv", test_argv),
+            mock.patch("besdq.cli.BESDQueryEngine"),
+            mock.patch("besdq.cli.BESDQueryIndex"),
+            contextlib.redirect_stderr(io.StringIO()) as stderr
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("mutually exclusive", stderr.getvalue())
+
+    def test_cli_rejects_mixed_identifier_and_region_queries(self):
+        test_argv = [
+            "besdq",
+            "--beqtl-summary", "dummy",
+            "--out", "out",
+            "--snp", "rs1",
+            "--snp-chrpos", "1:100-200",
+            "--probe-chrpos", "1:100-200",
+        ]
+        with (
+            mock.patch("sys.argv", test_argv),
+            mock.patch("besdq.cli.BESDQueryEngine"),
+            mock.patch("besdq.cli.BESDQueryIndex"),
+            contextlib.redirect_stderr(io.StringIO()) as stderr
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("Cannot combine --snp/--probe/--gene", stderr.getvalue())
 
 
 if __name__ == '__main__':

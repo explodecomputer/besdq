@@ -39,6 +39,9 @@ def parse_chrpos(chrpos_str: str) -> tuple[str, int, int]:
         except ValueError:
             raise ValueError(f"Invalid position format in {chrpos_str}. Expected: integer position")
 
+    if start_bp > end_bp:
+        raise ValueError(f"Invalid range in {chrpos_str}. Start position must be <= end position")
+
     return chr_part, start_bp, end_bp
 
 
@@ -164,8 +167,35 @@ def main():
         is_index = False
 
     # Determine query type and validate arguments
-    has_snp_query = args.snp or args.snp_chrpos or args.snp_chr or args.from_snp_kb or args.to_snp_kb or args.from_snp_bp or args.to_snp_bp
-    has_probe_query = args.probe or args.probe_chrpos or args.probe_chr or args.from_probe_kb or args.to_probe_kb or args.from_probe_bp or args.to_probe_bp or args.gene
+    has_snp_query = bool(
+        args.snp or args.snp_chrpos or args.snp_chr
+        or args.from_snp_kb is not None or args.to_snp_kb is not None
+        or args.from_snp_bp is not None or args.to_snp_bp is not None
+    )
+    has_probe_query = bool(
+        args.probe or args.probe_chrpos or args.probe_chr or args.gene
+        or args.from_probe_kb is not None or args.to_probe_kb is not None
+        or args.from_probe_bp is not None or args.to_probe_bp is not None
+    )
+    id_query_count = sum(bool(x) for x in (args.snp, args.probe, args.gene))
+    has_region_query_args = bool(
+        args.snp_chrpos or args.probe_chrpos
+        or args.snp_chr or args.probe_chr
+        or args.from_snp_kb is not None or args.to_snp_kb is not None
+        or args.from_snp_bp is not None or args.to_snp_bp is not None
+        or args.from_probe_kb is not None or args.to_probe_kb is not None
+        or args.from_probe_bp is not None or args.to_probe_bp is not None
+    )
+
+    if id_query_count > 1:
+        print("Error: --snp, --probe, and --gene are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if id_query_count == 1 and has_region_query_args:
+        print("Error: Cannot combine --snp/--probe/--gene with region query options", file=sys.stderr)
+        sys.exit(1)
+    if id_query_count == 0 and (not has_snp_query or not has_probe_query):
+        print("Error: Cis-window queries require both SNP and probe query arguments", file=sys.stderr)
+        sys.exit(1)
 
     if args.snp:
         # Query by SNP ID(s)

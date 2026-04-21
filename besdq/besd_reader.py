@@ -30,6 +30,16 @@ def norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + sign * y)
 
 
+def calculate_p_value(beta: float, se: float) -> float:
+    """Calculate two-tailed p-value with bounds checking."""
+    if se <= 0 or not math.isfinite(beta) or not math.isfinite(se):
+        return 1.0
+
+    z_score = abs(beta / se)
+    pval = 2.0 * (1.0 - norm_cdf(z_score))
+    return min(1.0, max(0.0, pval))
+
+
 class IndexReader:
     """Read .esi or .epi index files."""
 
@@ -38,7 +48,7 @@ class IndexReader:
         """Read SNP index file."""
         snps = []
         with open(esi_path, 'r') as f:
-            for row_idx, line in enumerate(f):
+            for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
@@ -49,7 +59,7 @@ class IndexReader:
 
                 try:
                     snps.append({
-                        'row_idx': row_idx,
+                        'row_idx': len(snps),
                         'chr': parts[0],
                         'snp_id': parts[1],
                         'genetic_dist': float(parts[2]) if parts[2] != 'NA' else None,
@@ -68,7 +78,7 @@ class IndexReader:
         """Read probe index file."""
         probes = []
         with open(epi_path, 'r') as f:
-            for row_idx, line in enumerate(f):
+            for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
@@ -79,7 +89,7 @@ class IndexReader:
 
                 try:
                     probes.append({
-                        'row_idx': row_idx,
+                        'row_idx': len(probes),
                         'chr': parts[0],
                         'probe_id': parts[1],
                         'genetic_dist': float(parts[2]) if len(parts) > 2 and parts[2] != 'NA' else None,
@@ -277,12 +287,7 @@ class BESDQueryEngine:
             for snp_idx, beta, se in assocs:
                 if snp_idx in snp_indices_set:
                     snp = self.snp_by_idx[snp_idx]
-                    # Calculate p-value: two-tailed test
-                    if se > 0:
-                        z_score = abs(beta / se)
-                        pval = 2 * (1 - norm_cdf(z_score))
-                    else:
-                        pval = 1.0  # Unable to calculate p-value without SE
+                    pval = calculate_p_value(beta, se)
 
                     associations.append({
                         'snp_id': snp['snp_id'],
@@ -326,11 +331,7 @@ class BESDQueryEngine:
 
             for snp_idx, beta, se in assocs:
                 if snp_idx == target_snp_idx:
-                    if se > 0:
-                        z_score = abs(beta / se)
-                        pval = 2 * (1 - norm_cdf(z_score))
-                    else:
-                        pval = 1.0
+                    pval = calculate_p_value(beta, se)
 
                     associations.append({
                         'snp_id': snp['snp_id'],
@@ -370,11 +371,7 @@ class BESDQueryEngine:
         associations = []
         for snp_idx, beta, se in assocs:
             snp = self.snp_by_idx[snp_idx]
-            if se > 0:
-                z_score = abs(beta / se)
-                pval = 2 * (1 - norm_cdf(z_score))
-            else:
-                pval = 1.0
+            pval = calculate_p_value(beta, se)
 
             associations.append({
                 'snp_id': snp['snp_id'],
@@ -415,11 +412,7 @@ class BESDQueryEngine:
 
             for snp_idx, beta, se in assocs:
                 snp = self.snp_by_idx[snp_idx]
-                if se > 0:
-                    z_score = abs(beta / se)
-                    pval = 2 * (1 - norm_cdf(z_score))
-                else:
-                    pval = 1.0
+                pval = calculate_p_value(beta, se)
 
                 associations.append({
                     'snp_id': snp['snp_id'],
@@ -437,4 +430,3 @@ class BESDQueryEngine:
                 })
 
         return associations
-

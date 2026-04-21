@@ -28,6 +28,16 @@ def norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + sign * y)
 
 
+def calculate_p_value(beta: float, se: float) -> float:
+    """Calculate two-tailed p-value with bounds checking."""
+    if se <= 0 or not math.isfinite(beta) or not math.isfinite(se):
+        return 1.0
+
+    z_score = abs(beta / se)
+    pval = 2.0 * (1.0 - norm_cdf(z_score))
+    return min(1.0, max(0.0, pval))
+
+
 class BESDQueryIndex:
     """Query BESD data from SQLite index database."""
 
@@ -181,12 +191,7 @@ class BESDQueryIndex:
                     beta = float(betas[i])
                     se = float(ses[i])
 
-                    # Calculate p-value
-                    if se > 0:
-                        z_score = abs(beta / se)
-                        pval = 2 * (1 - norm_cdf(z_score))
-                    else:
-                        pval = 1.0
+                    pval = calculate_p_value(beta, se)
 
                     associations.append({
                         'snp_id': snp['snp_id'],
@@ -255,11 +260,7 @@ class BESDQueryIndex:
                 beta = float(betas[i])
                 se = float(ses[i])
 
-                if se > 0:
-                    z_score = abs(beta / se)
-                    pval = 2 * (1 - norm_cdf(z_score))
-                else:
-                    pval = 1.0
+                pval = calculate_p_value(beta, se)
 
                 associations.append({
                     'snp_id': snp['snp_id'],
@@ -306,34 +307,22 @@ class BESDQueryIndex:
 
         # Search all probes for associations with this SNP
         associations = []
-        cursor.execute("SELECT row_idx FROM epi")
+        cursor.execute("""
+            SELECT row_idx, chr, probe_id, probe_bp, gene
+            FROM epi
+        """)
         for probe_row in cursor.fetchall():
-            probe_idx = probe_row['row_idx']
+            probe_data = dict(probe_row)
+            probe_idx = probe_data['row_idx']
             snp_indices, betas, ses = self.get_probe_snps(probe_idx)
 
-            # Find this SNP in the probe's data - convert to int for comparison
-            target_idx_int = int(target_snp_idx)
-            snp_indices_int = [int(idx) for idx in snp_indices]
-
-            if target_idx_int in snp_indices_int:
-                match_idx = snp_indices_int.index(target_idx_int)
+            # Find this SNP in the probe's data
+            match_indices = np.where(snp_indices == target_snp_idx)[0]
+            if len(match_indices) > 0:
+                match_idx = int(match_indices[0])
                 beta = float(betas[match_idx])
                 se = float(ses[match_idx])
-
-                if se > 0:
-                    z_score = abs(beta / se)
-                    pval = 2 * (1 - norm_cdf(z_score))
-                else:
-                    pval = 1.0
-
-                # Get probe metadata
-                cursor.execute("""
-                    SELECT chr, probe_id, probe_bp, gene
-                    FROM epi
-                    WHERE row_idx = ?
-                """, (probe_idx,))
-
-                probe_data = dict(cursor.fetchone())
+                pval = calculate_p_value(beta, se)
 
                 associations.append({
                     'snp_id': snp['snp_id'],
@@ -400,11 +389,7 @@ class BESDQueryIndex:
                         beta = float(betas[i])
                         se = float(ses[i])
 
-                        if se > 0:
-                            z_score = abs(beta / se)
-                            pval = 2 * (1 - norm_cdf(z_score))
-                        else:
-                            pval = 1.0
+                        pval = calculate_p_value(beta, se)
 
                         associations.append({
                             'snp_id': snp['snp_id'],
