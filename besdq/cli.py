@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Dict
 
 from .besd_reader import BESDQueryEngine
+from .builder import BESDIndexBuilder
 
 
 def parse_chrpos(chrpos_str: str) -> tuple[str, int, int]:
@@ -83,6 +84,8 @@ def main():
     )
     parser.add_argument('--beqtl-summary', required=True,
                         help='Path to BESD files (without extension)')
+    parser.add_argument('--index',
+                        help='Create SQLite index database at specified path (e.g. data/westra.db)')
     parser.add_argument('--query', type=float, default=0.05,
                         help='P-value threshold for filtering results')
     parser.add_argument('--snp-chr',
@@ -109,10 +112,27 @@ def main():
                         help='Probe region end (bp)')
     parser.add_argument('--probe-chrpos',
                         help='Probe region as chr:pos or chr:start-end (e.g. 1:1140818 or 1:1000000-2000000)')
-    parser.add_argument('--out', required=True,
+    parser.add_argument('--out',
                         help='Output file prefix')
 
     args = parser.parse_args()
+
+    # Handle indexing mode
+    if args.index:
+        try:
+            builder = BESDIndexBuilder(args.index)
+            builder.build(args.beqtl_summary, force=False)
+            return
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+    # Query mode requires --out
+    if not args.out:
+        print("Error: --out is required for query mode", file=sys.stderr)
+        sys.exit(1)
 
     # Parse chrpos arguments if provided
     snp_chr = args.snp_chr

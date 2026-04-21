@@ -24,6 +24,21 @@ python3 -m besdq.cli --help
 
 ## Basic Usage
 
+### Creating an SQLite Index Database
+
+For improved performance on repeated queries, create a SQLite index database:
+
+```bash
+besdq --beqtl-summary data/westra_eqtl_hg19 --index data/westra_eqtl_hg19.db
+```
+
+This creates a database with:
+- SQLite tables for SNP and probe metadata with indexed columns for fast range queries
+- Per-probe BLOBs storing numpy arrays of associations (snp_indices, betas, SEs)
+- Full metadata preservation from the original BESD files
+
+The database can then be used for faster subsequent queries (future implementation).
+
 ### Command-line Interface
 
 Query a cis-window using chromosome and position ranges:
@@ -159,7 +174,8 @@ BESDQ expects three files with a common prefix:
 ## Requirements
 
 - Python 3.9+
-- No external dependencies for core functionality
+- numpy (for efficient array storage in database indices)
+- No external dependencies for core query functionality when not using database indices
 
 ## License
 
