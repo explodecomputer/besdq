@@ -37,7 +37,27 @@ This creates a database with:
 - Per-probe BLOBs storing numpy arrays of associations (snp_indices, betas, SEs)
 - Full metadata preservation from the original BESD files
 
-The database can then be used for faster subsequent queries (future implementation).
+### Querying the SQLite Index
+
+Use the index database for fast queries in Python:
+
+```python
+from besdq import BESDQueryIndex
+
+# Open index
+with BESDQueryIndex('data/westra_eqtl_hg19.db') as index:
+    # Query by cis-window
+    assocs = index.query_cis_window(
+        snp_chr='1', snp_start_kb=100, snp_end_kb=2000,
+        probe_chr='1', probe_start_kb=1000, probe_end_kb=2000,
+    )
+    
+    # Query by probe ID
+    assocs = index.query_by_probe_id('ILMN_2349633')
+    
+    # Query by SNP ID
+    assocs = index.query_by_snp_id('rs3818646')
+```
 
 ### Command-line Interface
 
@@ -146,22 +166,41 @@ python3 -m unittest tests.test_queries -v
 Run a specific test:
 
 ```bash
-python3 -m unittest tests.test_queries.TestBESDQueryEngine.test_single_position_query -v
+python3 -m unittest tests.test_queries.TestBESDQueryIndex.test_query_by_probe_id -v
 ```
 
 ### Test Coverage
 
-The test suite (`tests/test_queries.py`) includes:
+The test suite includes:
+
+**BESDQueryEngine (original BESD reader):**
 - Data loading verification (SNP/probe counts, format detection)
-- Single position queries
-- Range queries
+- Single position and range queries
 - P-value calculation accuracy
-- Beta and SE value storage
-- SNP and probe metadata indexing
+- Beta and SE storage
+- Metadata indexing
 - Chromosome and position filtering
 - Empty query handling
 
+**BESDQueryIndex (SQLite index):**
+- Metadata loading from database
+- Single position and range queries
+- P-value calculation
+- Query by probe ID
+- Query by SNP ID
+- **Consistency verification**: Confirms SQLite index produces identical results to BESD reader
+
 All tests use the `westra_eqtl_hg19` dataset as reference data.
+
+## Performance
+
+The SQLite index provides significant performance advantages:
+
+- **Metadata queries**: Indexed (chr, bp) columns enable O(log n) range queries on millions of SNPs/probes
+- **Association storage**: Per-probe BLOBs with numpy arrays maintain sequential read locality
+- **Deserialization**: Efficient numpy array deserialization directly from binary format
+
+The index database is typically 50-70% the size of the original BESD files and enables much faster repeated queries.
 
 ## File Format
 
