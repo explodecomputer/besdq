@@ -300,3 +300,141 @@ class BESDQueryEngine:
                     })
 
         return associations
+
+    def query_by_snp_id(self, snp_id: str) -> List[Dict]:
+        """Query all associations for a specific SNP.
+
+        Args:
+            snp_id: SNP ID to query
+
+        Returns:
+            List of associations for the SNP
+        """
+        # Find SNP
+        snp_list = [s for s in self.snps if s['snp_id'] == snp_id]
+        if not snp_list:
+            return []
+
+        snp = snp_list[0]
+        target_snp_idx = snp['row_idx']
+
+        # Search all probes for associations with this SNP
+        associations = []
+        for probe in self.probes:
+            probe_idx = probe['row_idx']
+            assocs = self.besd.get_probe_associations(probe_idx)
+
+            for snp_idx, beta, se in assocs:
+                if snp_idx == target_snp_idx:
+                    if se > 0:
+                        z_score = abs(beta / se)
+                        pval = 2 * (1 - norm_cdf(z_score))
+                    else:
+                        pval = 1.0
+
+                    associations.append({
+                        'snp_id': snp['snp_id'],
+                        'snp_chr': snp['chr'],
+                        'snp_bp': snp['bp'],
+                        'a1': snp['a1'],
+                        'a2': snp['a2'],
+                        'probe_id': probe['probe_id'],
+                        'probe_chr': probe['chr'],
+                        'probe_bp': probe['probe_bp'],
+                        'gene': probe['gene'],
+                        'beta': beta,
+                        'se': se,
+                        'pval': pval,
+                    })
+
+        return associations
+
+    def query_by_probe_id(self, probe_id: str) -> List[Dict]:
+        """Query all associations for a specific probe.
+
+        Args:
+            probe_id: Probe ID to query
+
+        Returns:
+            List of associations for the probe
+        """
+        # Find probe
+        probe_list = [p for p in self.probes if p['probe_id'] == probe_id]
+        if not probe_list:
+            return []
+
+        probe = probe_list[0]
+        probe_idx = probe['row_idx']
+        assocs = self.besd.get_probe_associations(probe_idx)
+
+        associations = []
+        for snp_idx, beta, se in assocs:
+            snp = self.snp_by_idx[snp_idx]
+            if se > 0:
+                z_score = abs(beta / se)
+                pval = 2 * (1 - norm_cdf(z_score))
+            else:
+                pval = 1.0
+
+            associations.append({
+                'snp_id': snp['snp_id'],
+                'snp_chr': snp['chr'],
+                'snp_bp': snp['bp'],
+                'a1': snp['a1'],
+                'a2': snp['a2'],
+                'probe_id': probe['probe_id'],
+                'probe_chr': probe['chr'],
+                'probe_bp': probe['probe_bp'],
+                'gene': probe['gene'],
+                'beta': beta,
+                'se': se,
+                'pval': pval,
+            })
+
+        return associations
+
+    def query_by_gene(self, gene_name: str) -> List[Dict]:
+        """Query all associations for a specific gene.
+
+        Args:
+            gene_name: Gene name to query
+
+        Returns:
+            List of associations for the gene
+        """
+        # Find all probes for this gene
+        probes_for_gene = [p for p in self.probes if p.get('gene') == gene_name]
+
+        if not probes_for_gene:
+            return []
+
+        associations = []
+        for probe in probes_for_gene:
+            probe_idx = probe['row_idx']
+            assocs = self.besd.get_probe_associations(probe_idx)
+
+            for snp_idx, beta, se in assocs:
+                snp = self.snp_by_idx[snp_idx]
+                if se > 0:
+                    z_score = abs(beta / se)
+                    pval = 2 * (1 - norm_cdf(z_score))
+                else:
+                    pval = 1.0
+
+                associations.append({
+                    'snp_id': snp['snp_id'],
+                    'snp_chr': snp['chr'],
+                    'snp_bp': snp['bp'],
+                    'a1': snp['a1'],
+                    'a2': snp['a2'],
+                    'probe_id': probe['probe_id'],
+                    'probe_chr': probe['chr'],
+                    'probe_bp': probe['probe_bp'],
+                    'gene': probe['gene'],
+                    'beta': beta,
+                    'se': se,
+                    'pval': pval,
+                })
+
+        return associations
+
