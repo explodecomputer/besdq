@@ -137,6 +137,11 @@ besdq --beqtl-summary data/westra_eqtl_hg19 \
   --out results/output
 ```
 
+Validation notes:
+- For `chr:start-end`, `start` must be less than or equal to `end`.
+- `--snp`, `--probe`, and `--gene` are mutually exclusive query modes.
+- Identifier query modes (`--snp`, `--probe`, `--gene`) cannot be combined with region options (`--snp-chr*`, `--probe-chr*`, `--from-*`, `--to-*`).
+
 #### P-value Filtering
 
 Filter results by p-value threshold (applies to both query modes):
