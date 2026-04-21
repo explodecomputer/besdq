@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "besdq"
+version = "0.1.0"
+description = "Fast queries of BESD eQTL summary statistics"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "BESD Query Contributors"}
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["besdq"]
+
+[project.scripts]
+besdq = "besdq.cli:main"
