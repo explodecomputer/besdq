@@ -152,16 +152,16 @@ besdq-discover-study 38714679 --output discovery.tsv
 
 Queries the EBI GWAS Catalog v2 API for all GCST accessions under PMID 38714679 and writes a discovery TSV with columns: `pmid`, `gcst_id`, `file_path` (harmonised FTP URL), `trait_name`, `gene`, `trait_chr`, `trait_bp`, `context`.
 
-To parse gene symbols from trait descriptions and map them to chromosomal positions using a local Ensembl annotation file:
+To parse gene symbols from trait descriptions and map them to chromosomal positions:
 
 ```bash
 besdq-discover-study 38714679 \
   --parse-gene \
-  --gene-annotation data/ensembl_genes.tsv \
+  --gene-annotation resources/ensembl_gene_tss_hg38.tsv \
   --output discovery.tsv
 ```
 
-The gene annotation TSV requires columns `gene_name`, `chr`, `bp` (TSS position). A suitable file can be exported from [Ensembl BioMart](https://www.ensembl.org/biomart).
+A pre-built gene annotation file for GRCh38 is included at `resources/ensembl_gene_tss_hg38.tsv` (41,333 HGNC symbols with canonical TSS positions, sourced from [Ensembl BioMart](https://www.ensembl.org/biomart) release 115). The file has three tab-separated columns: `gene_name`, `chr`, `bp` (TSS position). To regenerate or update it for a newer Ensembl release, see `scripts/fetch_ensembl_gene_tss.py`.
 
 ### 2. Stage 1: download, filter, write intermediate file pairs
 
