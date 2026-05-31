@@ -140,6 +140,85 @@ besdq --besd-index data/ebi_input/study.db \
 
 ---
 
+## Large-Scale Builds from EBI GWAS Catalog (Two-Stage Pipeline)
+
+For publications with hundreds or thousands of traits (e.g. pQTL/eQTL studies), use the **two-stage pipeline**. Stage 1 is resumable at trait granularity — a crash or network failure can be recovered without restarting — and peak disk usage is capped at `N_workers × source_file_size + intermediates` rather than requiring all files on disk simultaneously.
+
+### 1. Discover traits for a publication
+
+```bash
+besdq-discover-study 38714679 --output discovery.tsv
+```
+
+Queries the EBI GWAS Catalog v2 API for all GCST accessions under PMID 38714679 and writes a discovery TSV with columns: `pmid`, `gcst_id`, `file_path` (harmonised FTP URL), `trait_name`, `gene`, `trait_chr`, `trait_bp`, `context`.
+
+To parse gene symbols from trait descriptions and map them to chromosomal positions using a local Ensembl annotation file:
+
+```bash
+besdq-discover-study 38714679 \
+  --parse-gene \
+  --gene-annotation data/ensembl_genes.tsv \
+  --output discovery.tsv
+```
+
+The gene annotation TSV requires columns `gene_name`, `chr`, `bp` (TSS position). A suitable file can be exported from [Ensembl BioMart](https://www.ensembl.org/biomart).
+
+### 2. Stage 1: download, filter, write intermediate file pairs
+
+```bash
+besdq-build-stage1 discovery.tsv \
+  --workdir /data/workdir \
+  --parallel-downloads 4
+```
+
+For each trait, Stage 1 streams the harmonised GWAS-SSF file, applies the three-tier significance filter, writes a compact intermediate pair (`GCST*.tsv.gz` + `GCST*.yaml`) under `<workdir>/38714679/`, then deletes the downloaded source. Local file paths (no URL scheme) are filtered in place and never deleted.
+
+**Resumability:** re-running the same command skips completed traits, retries previously-failed ones (`GCST*.failed.yaml`), and ignores partial writes (`.tmp` files). A summary is printed at the end:
+
+```
+[HH:MM:SS] Stage 1 complete — 312 completed, 0 skipped, 1 failed
+```
+
+**Key options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--workdir DIR` | — | Working directory for intermediates (required) |
+| `--parallel-downloads N` | 1 | Concurrent download+filter workers |
+| `--cis-radius BP` | 1,000,000 | Cis window radius |
+| `--sig-threshold P` | 5e-8 | Genome-wide significance threshold |
+| `--sug-threshold P` | 1e-4 | Suggestive threshold |
+| `--sig-radius BP` | 500,000 | Trans peak window radius |
+| `--ld-reference PREFIX` | — | plink2 LD reference prefix for trans clumping |
+
+### 3. Stage 2: collate intermediates into a queryable index
+
+```bash
+besdq-build-stage2 /data/workdir/38714679/ study_38714679.db
+```
+
+Reads all completed `GCST*.tsv.gz` + `GCST*.yaml` pairs (skips `*.failed.yaml`) and writes a single queryable SQLite index. Always a clean rebuild — safe to re-run.
+
+### 4. Query the resulting index
+
+```bash
+besdq --db study_38714679.db --info
+
+# Query by trait (GCST accession)
+besdq --db study_38714679.db --probe GCST90275731 --out results/out
+
+# Query by SNP
+besdq --db study_38714679.db --snp rs12238997 --out results/out
+
+# Query a cis-window
+besdq --db study_38714679.db \
+  --snp-chrpos 4:1000000-2000000 \
+  --probe-chrpos 4:1000000-2000000 \
+  --out results/out
+```
+
+---
+
 ## Basic Usage
 
 ### Two Query Options
