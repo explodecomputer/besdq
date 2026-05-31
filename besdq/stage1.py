@@ -189,9 +189,10 @@ def _process_trait_args(args: tuple) -> Tuple[str, str]:
     try:
         if source_is_url:
             tmp_dl = work_pmid_dir / f"{gcst_id}.download.tmp"
-            _download_file(file_path, tmp_dl)
+            # Set downloaded=True before attempt so finally always cleans up partial writes
             local_path = str(tmp_dl)
             downloaded = True
+            _download_file(file_path, tmp_dl)
 
         pass1_args = (
             local_path,
