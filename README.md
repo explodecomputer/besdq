@@ -85,6 +85,10 @@ time import-gwas-ssf \
   --output data/ebi_input/study3.db
 ```
 
+```bash
+besdq --db data/ebi_input/study3.db --info
+```
+
 **Significance filtering applied during import:**
 
 | Tier | Condition | Stored |
