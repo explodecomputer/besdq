@@ -3,10 +3,18 @@
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 from .gwas_ssf_reader import GwasSsfRow
+
+
+@dataclass
+class ClumpResult:
+    """Result of LD clumping: retained rows and the number of independent peaks."""
+    rows: List[GwasSsfRow] = field(default_factory=list)
+    peak_count: int = 0
 
 
 def _check_plink2() -> str:
@@ -27,7 +35,7 @@ def clump_trans_peaks(
     clump_r2: float = 0.01,
     clump_kb: int = 10_000,
     all_rows: Optional[List[GwasSsfRow]] = None,
-) -> List[GwasSsfRow]:
+) -> ClumpResult:
     """Run LD clumping on significant trans candidates and expand to windows.
 
     Parameters
@@ -41,10 +49,10 @@ def clump_trans_peaks(
 
     Returns
     -------
-    List of GwasSsfRow within sig_radius of each independent lead SNP
+    ClumpResult with retained rows and the number of independent peaks (lead SNPs)
     """
     if not candidates:
-        return []
+        return ClumpResult(rows=[], peak_count=0)
 
     plink2 = _check_plink2()
 
@@ -102,7 +110,7 @@ def clump_trans_peaks(
 
     if not lead_positions:
         # No clumped leads found; fall back to returning all candidates
-        return candidates
+        return ClumpResult(rows=candidates, peak_count=0)
 
     # Expand each lead SNP to a ±sig_radius window
     source = all_rows if all_rows is not None else candidates
@@ -118,4 +126,4 @@ def clump_trans_peaks(
                     retained.append(row)
                 break
 
-    return retained
+    return ClumpResult(rows=retained, peak_count=len(lead_positions))

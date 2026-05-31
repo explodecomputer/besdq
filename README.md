@@ -81,7 +81,8 @@ Optional columns:
 time import-gwas-ssf \
   --trait-annotation data/ebi_input/traits.tsv \
   --ld-reference data/ldref/EUR \
-  --output data/ebi_input/study.db
+  --workers 3 \
+  --output data/ebi_input/study3.db
 ```
 
 **Significance filtering applied during import:**
@@ -127,6 +128,7 @@ besdq --besd-index data/ebi_input/study.db --probe GCST90275731 --out results/ou
 
 # Query by genomic region
 besdq --besd-index data/ebi_input/study.db \
+  --query 0.05 \
   --snp-chrpos 1:206000000-208000000 \
   --probe-chrpos 1:205000000-208000000 \
   --out results/out

@@ -79,8 +79,10 @@ class BESDIndexBuilder:
 
         print("Writing metadata...")
         self._write_metadata(cursor, {
+            'source': 'besd',
             'format_type': besd.format_type,
             'n_snps': str(len(snps)),
+            'n_traits': str(len(probes)),
             'n_probes': str(len(probes)),
             'besd_path': besd_path,
             'esi_path': esi_path,
@@ -157,7 +159,12 @@ class BESDIndexBuilder:
                 trait_bp INTEGER,
                 trait_var REAL,
                 gene TEXT,
-                context TEXT
+                context TEXT,
+                n_source_snps INTEGER,
+                n_cis INTEGER,
+                n_sig_trans_peaks INTEGER,
+                n_sig_trans_peaks_approx INTEGER,
+                n_sug_trans INTEGER
             )
         """)
 

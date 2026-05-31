@@ -25,6 +25,10 @@ class _TraitResult:
     n_total_read: int = 0
     n_retained: int = 0
     estimated_trait_var: Optional[float] = None
+    n_cis: int = 0
+    n_sig_trans_peaks: int = 0
+    n_sig_trans_peaks_approx: bool = False  # True when distance-based fallback was used
+    n_sug_trans: int = 0
 
 
 def _pass1_worker(args: tuple) -> _TraitResult:
@@ -76,27 +80,39 @@ def _pass1_worker(args: tuple) -> _TraitResult:
     )
 
     cis_rows = list(filter_result.cis)
-    retained = cis_rows + list(filter_result.sug_trans)
+    sug_trans_rows = list(filter_result.sug_trans)
+    retained = cis_rows + sug_trans_rows
 
     # LD clumping for significant trans candidates
+    sig_trans_peaks = 0
+    sig_trans_peaks_approx = False
     if filter_result.sig_trans_candidates and plink2_pfile:
         try:
             from .ld_clumping import clump_trans_peaks
-            trans_retained = clump_trans_peaks(
+            clump_result = clump_trans_peaks(
                 filter_result.sig_trans_candidates,
                 plink2_pfile=plink2_pfile,
                 sig_radius=sig_radius,
                 clump_r2=clump_r2,
                 clump_kb=clump_kb,
-                all_rows=candidates,  # candidates cover p < sug_threshold + all cis
+                all_rows=candidates,
             )
-            retained.extend(trans_retained)
+            retained.extend(clump_result.rows)
+            sig_trans_peaks = clump_result.peak_count
         except ImportError:
-            # plink2 not available; store all sig candidates as-is
             retained.extend(filter_result.sig_trans_candidates)
+            from .peak_count import count_peaks_by_distance
+            sig_trans_peaks = count_peaks_by_distance(
+                filter_result.sig_trans_candidates, sig_radius
+            )
+            sig_trans_peaks_approx = True
     elif filter_result.sig_trans_candidates:
-        # No LD reference; store all sig candidates as-is
         retained.extend(filter_result.sig_trans_candidates)
+        from .peak_count import count_peaks_by_distance
+        sig_trans_peaks = count_peaks_by_distance(
+            filter_result.sig_trans_candidates, sig_radius
+        )
+        sig_trans_peaks_approx = True
 
     # Deduplicate by snp_key
     seen: set = set()
@@ -110,6 +126,10 @@ def _pass1_worker(args: tuple) -> _TraitResult:
     result.rows = deduped
     result.cis_rows = cis_rows
     result.n_retained = len(deduped)
+    result.n_cis = len(cis_rows)
+    result.n_sig_trans_peaks = sig_trans_peaks
+    result.n_sig_trans_peaks_approx = sig_trans_peaks_approx
+    result.n_sug_trans = len(sug_trans_rows)
 
     # Estimate trait_var from cis SNPs: median(se^2 * n * 2 * eaf * (1-eaf))
     if cis_rows and sample_size:
@@ -245,12 +265,19 @@ class GwasSsfIndexBuilder:
 
             cursor.execute(
                 "INSERT INTO epi (row_idx, trait_id, trait_name, trait_chr, trait_bp, "
-                "trait_var, gene, context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "trait_var, gene, context, n_source_snps, n_cis, n_sig_trans_peaks, "
+                "n_sig_trans_peaks_approx, n_sug_trans) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     epi_idx, trait_cfg.trait_id, trait_cfg.trait_name,
                     trait_cfg.trait_chr, trait_cfg.trait_bp,
                     resolved_trait_var,
                     trait_cfg.gene, trait_cfg.context,
+                    r.n_total_read if r else None,
+                    r.n_cis if r else None,
+                    r.n_sig_trans_peaks if r else None,
+                    int(r.n_sig_trans_peaks_approx) if r else None,
+                    r.n_sug_trans if r else None,
                 ),
             )
 
@@ -290,18 +317,18 @@ class GwasSsfIndexBuilder:
                 study_meta_written = True
 
         # Store basic metadata
-        cursor.execute(
-            "INSERT INTO besd_meta (key, value) VALUES (?, ?)",
+        for key, value in [
             ('n_snps', str(len(sorted_keys))),
-        )
-        cursor.execute(
-            "INSERT INTO besd_meta (key, value) VALUES (?, ?)",
             ('n_traits', str(len(traits))),
-        )
-        cursor.execute(
-            "INSERT INTO besd_meta (key, value) VALUES (?, ?)",
             ('source', 'gwas-ssf'),
-        )
+            ('cis_radius', str(cis_radius)),
+            ('sig_threshold', str(sig_threshold)),
+            ('sug_threshold', str(sug_threshold)),
+            ('sig_radius', str(sig_radius)),
+        ]:
+            cursor.execute(
+                "INSERT INTO besd_meta (key, value) VALUES (?, ?)", (key, value)
+            )
 
         # Indexes
         cursor.execute("CREATE INDEX idx_esi_chr_bp ON esi(chr, bp)")
@@ -341,7 +368,12 @@ class GwasSsfIndexBuilder:
                 trait_bp INTEGER,
                 trait_var REAL,
                 gene TEXT,
-                context TEXT
+                context TEXT,
+                n_source_snps INTEGER,
+                n_cis INTEGER,
+                n_sig_trans_peaks INTEGER,
+                n_sig_trans_peaks_approx INTEGER,
+                n_sug_trans INTEGER
             )
         """)
         cursor.execute("""

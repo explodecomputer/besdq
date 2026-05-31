@@ -1,5 +1,41 @@
 # BESDQ Domain Glossary
 
+## GCST Accession
+
+The EBI GWAS Catalog identifier for a single GWAS-SSF file. In BESDQ's domain, each GCST accession corresponds to exactly one **Trait** (one GWAS-SSF file, one row in `epi`). Multiple GCST accessions are grouped under a single PubMed ID (study batch).
+
+## Study Batch
+
+A set of GCST accessions sharing a PubMed ID. The natural unit of bulk ingestion. Intermediate files from Stage 1 are grouped in a subdirectory named by PMID (or a user-supplied project name).
+
+## Two-Stage Build
+
+The pipeline for constructing a BESDQ index from EBI GWAS-SSF files at scale:
+
+- **Stage 1** (`build-stage1`): for each Trait in a discovery TSV, download the GWAS-SSF file, extract cis/trans regions into a TSV+YAML intermediate file pair, delete the original download. Resumable: a trait is considered complete when both `GCST*.tsv.gz` and `GCST*.yaml` exist (written atomically). Failed traits produce `GCST*.failed.yaml` and are retried on re-run. Supports bounded-concurrency download via `--parallel-downloads N`.
+- **Stage 2** (`build-stage2`): consume all completed intermediates in a PMID subdirectory and collate into the final SQLite index. Always a clean rebuild (no resumability needed — no downloads, fast).
+
+## Intermediate File Pair
+
+The on-disk representation of a single Trait's filtered associations produced by Stage 1. Two files per trait:
+- `GCST<id>.tsv.gz` — filtered rows (cis + trans), human-readable gzipped TSV
+- `GCST<id>.yaml` — per-trait metadata (trait_chr, trait_bp, trait_var, tier counts, etc.) needed by Stage 2
+
+Written atomically via `.tmp` rename. Stored under `<workdir>/<pmid>/`.
+
+## Source Locator
+
+The value in the `file_path` column of the annotation TSV passed to `build-stage1`. Resolved at runtime as:
+
+- **URL** (starts with `http://`, `https://`, or `ftp://`): file is downloaded to a temp location, filtered, then **deleted** after the intermediate is written.
+- **Local path**: file is filtered in place and **never deleted** — the user owns it.
+
+The distinction is purely syntactic (URL scheme present or absent). No other behaviour differs between the two cases.
+
+## Discovery Script
+
+The `discover-study` command. Given a PubMed ID, queries the EBI GWAS Catalog API to enumerate all GCST accessions and their FTP URLs. Optionally parses gene symbols from trait description fields (`--parse-gene` flag, default off) and maps them to chr/bp via a local Ensembl gene annotation file. Emits an annotation TSV consumed by `build-stage1`.
+
 ## Trait
 
 A molecular phenotype being measured — e.g. gene expression of IL10, a CpG methylation level, a protein abundance. The generalisation of "probe" (the BESD binary format's term). Each BESDQ dataset contains one or more traits, each with its own row in the `epi` table and its own statistics block in `probe_data`.
@@ -120,7 +156,12 @@ The filter applied during import from text files (e.g. GWAS-SSF) to determine wh
 
 **Sig-radius**: the distance from a significant trans lead SNP within which all variants are retained. Default 500,000 bp (±500 kb).
 
-Independent significant trans peaks are identified by LD clumping with plink2 (must be on PATH) and a user-supplied plink2-format LD reference panel (`--pfile` prefix). Clumping defaults: r²=0.01, window=10,000 kb. Thresholds and radii are configurable at import time.
+Independent significant trans peaks are identified by LD clumping with plink2 (must be on PATH) and a user-supplied plink2-format LD reference panel (`--pfile` prefix). Clumping defaults: r²=0.01, window=10,000 kb. Thresholds and radii are configurable at import time. When plink2 clumping is not run, peak count is approximated by counting variants more than sig-radius apart as independent.
+
+**Peak count**: the number of LD-independent signals within a tier. Distinct from SNP count (which counts all stored variants including neighbourhood expansion around peaks).
+- Cis tier: no peak concept — all variants stored unconditionally; reported as raw SNP count.
+- Significant trans tier: number of independent peaks (lead SNPs from clumping, or distance-based approximation). The total SNPs stored equals all variants within sig-radius of each peak.
+- Suggestive trans tier: each stored variant is already a singleton (no neighbourhood expansion), so peak count equals SNP count.
 
 BESD files imported via the legacy path arrive pre-filtered and are stored verbatim — the Lean Index applies no additional filters to them.
 

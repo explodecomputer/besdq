@@ -454,7 +454,7 @@ class TestCLIValidation(unittest.TestCase):
     def test_cli_rejects_conflicting_identifier_queries(self):
         test_argv = [
             "besdq",
-            "--beqtl-summary", "dummy",
+            "--besd", "dummy",
             "--out", "out",
             "--snp", "rs1",
             "--probe", "probe1",
@@ -473,7 +473,7 @@ class TestCLIValidation(unittest.TestCase):
     def test_cli_rejects_mixed_identifier_and_region_queries(self):
         test_argv = [
             "besdq",
-            "--beqtl-summary", "dummy",
+            "--besd", "dummy",
             "--out", "out",
             "--snp", "rs1",
             "--snp-chrpos", "1:100-200",

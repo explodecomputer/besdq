@@ -1,6 +1,8 @@
 """Command-line interface for BESD query tool."""
 
 import argparse
+import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import List, Dict
@@ -53,7 +55,7 @@ def write_output(associations: List[Dict], output_path: str, pval_threshold: flo
     # Filter by p-value threshold
     filtered = [a for a in associations if a['pval'] < pval_threshold]
 
-    with open(f"{output_path}.txt", 'w') as f:
+    with open(output_path, 'w') as f:
         # Header
         f.write('\t'.join([
             'SNP', 'SNP_Chr', 'SNP_bp', 'A1', 'A2',
@@ -78,9 +80,221 @@ def write_output(associations: List[Dict], output_path: str, pval_threshold: flo
                 f"{assoc['pval']:.6e}",
             ]) + '\n')
 
-    print(f"Results written to {output_path}.txt")
+    print(f"Results written to {output_path}")
     print(f"  Associations (before filter): {len(associations)}")
     print(f"  Associations (after p-value filter < {pval_threshold}): {len(filtered)}")
+
+
+def _distribution(values):
+    """Return distribution stats dict for a list of numbers (Nones skipped).
+
+    Returns None if there are no non-None values.
+    """
+    vs = [v for v in values if v is not None]
+    if not vs:
+        return None
+    n = len(vs)
+    vs_sorted = sorted(vs)
+
+    def pct(p):
+        idx = (n - 1) * p / 100.0
+        lo = int(idx)
+        hi = min(lo + 1, n - 1)
+        return vs_sorted[lo] + (vs_sorted[hi] - vs_sorted[lo]) * (idx - lo)
+
+    return {
+        'n': n,
+        'min': vs_sorted[0],
+        'p25': pct(25),
+        'p50': pct(50),
+        'p75': pct(75),
+        'max': vs_sorted[-1],
+        'mean': sum(vs) / n,
+    }
+
+
+_DIST_COL_W = 12  # column width for distribution stats
+
+
+def _fmt_dist_row(label: str, dist) -> str:
+    """Format one distribution row for the human-readable table."""
+    w = _DIST_COL_W
+    if dist is None:
+        dash = f"{'—':>{w}}"
+        return f"{label:<22}" + dash * 6
+    return (
+        f"{label:<22}"
+        f"{int(round(dist['min'])):>{w},}"
+        f"{int(round(dist['p25'])):>{w},}"
+        f"{int(round(dist['p50'])):>{w},}"
+        f"{int(round(dist['p75'])):>{w},}"
+        f"{int(round(dist['max'])):>{w},}"
+        f"{dist['mean']:>{w}.1f}"
+    )
+
+
+def _show_info_db(db_path: str, as_json: bool = False) -> None:
+    """Print summary of a BESDQ SQLite index to stdout."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    # Schema version check: require n_cis column
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(epi)")}
+    if 'n_cis' not in cols:
+        conn.close()
+        print(
+            "Error: database schema is outdated — please rebuild with import-gwas-ssf",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    meta = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM besd_meta")}
+
+    traits = [dict(row) for row in conn.execute(
+        "SELECT trait_id, trait_name, gene, context, trait_chr, trait_bp, "
+        "n_source_snps, n_cis, n_sig_trans_peaks, n_sig_trans_peaks_approx, n_sug_trans "
+        "FROM epi ORDER BY row_idx"
+    )]
+    counts = {row['probe_idx']: row['snp_count']
+              for row in conn.execute("SELECT probe_idx, snp_count FROM probe_data")}
+    conn.close()
+
+    total_assocs = sum(counts.values())
+    n_traits = len(traits)
+    study_meta = {}
+    if 'study_metadata' in meta:
+        try:
+            study_meta = json.loads(meta['study_metadata'])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Compute distributions
+    dist_stored      = _distribution([counts.get(i, 0) for i in range(n_traits)])
+    dist_source_snps = _distribution([t['n_source_snps'] for t in traits])
+    dist_cis         = _distribution([t['n_cis'] for t in traits])
+    dist_sig_peaks   = _distribution([t['n_sig_trans_peaks'] for t in traits])
+    dist_sug_trans   = _distribution([t['n_sug_trans'] for t in traits])
+
+    if as_json:
+        out = {
+            'path': db_path,
+            'source': meta.get('source', 'unknown'),
+            'n_traits': n_traits,
+            'n_snps': int(meta.get('n_snps', 0)),
+            'total_associations': total_assocs,
+            'build_params': {
+                'cis_radius': int(meta['cis_radius']) if 'cis_radius' in meta else None,
+                'sig_threshold': float(meta['sig_threshold']) if 'sig_threshold' in meta else None,
+                'sug_threshold': float(meta['sug_threshold']) if 'sug_threshold' in meta else None,
+                'sig_radius': int(meta['sig_radius']) if 'sig_radius' in meta else None,
+            },
+            'study_metadata': study_meta,
+            'distributions': {
+                'snp_count_stored': dist_stored,
+                'n_source_snps': dist_source_snps,
+                'n_cis': dist_cis,
+                'n_sig_trans_peaks': dist_sig_peaks,
+                'n_sug_trans': dist_sug_trans,
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    # Human-readable output
+    print(f"\nDataset:   {db_path}")
+    print(f"Source:    {meta.get('source', 'unknown')}")
+    print(f"Traits:    {n_traits:,}")
+    print(f"SNPs:      {int(meta.get('n_snps', 0)):,}")
+    print(f"Assocs:    {total_assocs:,}")
+
+    if any(k in meta for k in ('cis_radius', 'sig_threshold', 'sug_threshold', 'sig_radius')):
+        print("\nBuild parameters:")
+        if 'cis_radius' in meta:
+            print(f"  cis_radius:     {int(meta['cis_radius']):,} bp")
+        if 'sig_threshold' in meta:
+            print(f"  sig_threshold:  {meta['sig_threshold']}")
+        if 'sug_threshold' in meta:
+            print(f"  sug_threshold:  {meta['sug_threshold']}")
+        if 'sig_radius' in meta:
+            print(f"  sig_radius:     {int(meta['sig_radius']):,} bp")
+
+    if study_meta:
+        print("\nStudy metadata:")
+        for key in ('genome_assembly', 'analysis_software', 'imputation_panel'):
+            if key in study_meta:
+                print(f"  {key}: {study_meta[key]}")
+        if 'samples' in study_meta and study_meta['samples']:
+            s = study_meta['samples'][0]
+            if 'sample_size' in s:
+                print(f"  sample_size: {s['sample_size']}")
+            if 'sample_ancestry' in s:
+                print(f"  ancestry: {', '.join(s['sample_ancestry'])}")
+
+    # Distribution table
+    w = _DIST_COL_W
+    hdr = f"\n{'':22}{'min':>{w}}{'p25':>{w}}{'p50':>{w}}{'p75':>{w}}{'max':>{w}}{'mean':>{w}}"
+    sep = "-" * (22 + w * 6)
+    print(hdr)
+    print(sep)
+    print(_fmt_dist_row("snp_count (stored)", dist_stored))
+    if dist_source_snps is not None:
+        print(_fmt_dist_row("n_source_snps", dist_source_snps))
+    if dist_cis is not None:
+        print(_fmt_dist_row("n_cis", dist_cis))
+    if dist_sig_peaks is not None:
+        print(_fmt_dist_row("n_sig_trans_peaks", dist_sig_peaks))
+    if dist_sug_trans is not None:
+        print(_fmt_dist_row("n_sug_trans", dist_sug_trans))
+    print()
+
+
+def _show_info_besd(besd_path: str, as_json: bool = False) -> None:
+    """Print summary of a legacy BESD binary dataset to stdout."""
+    from .besd_reader import BESDQueryEngine
+    engine = BESDQueryEngine(besd_path)
+
+    n_probes = len(engine.probes)
+    n_snps = len(engine.snps)
+
+    # Total associations: _val_num counts betas+SEs together, so divide by 2
+    total_assocs = (engine.besd._val_num // 2) if engine.besd._val_num else 0
+
+    # Compute per-probe SNP counts from already-loaded cols array (O(1) per probe)
+    snp_counts = []
+    for probe in engine.probes:
+        idx = probe['row_idx']
+        if engine.besd._cols and (idx * 2 + 1) < len(engine.besd._cols):
+            snp_counts.append(int(engine.besd._cols[idx * 2 + 1] - engine.besd._cols[idx * 2]))
+        else:
+            snp_counts.append(0)
+
+    dist_stored = _distribution(snp_counts)
+
+    if as_json:
+        print(json.dumps({
+            'path': besd_path,
+            'source': 'besd',
+            'n_probes': n_probes,
+            'n_snps': n_snps,
+            'total_associations': total_assocs,
+            'distributions': {
+                'snp_count_stored': dist_stored,
+            },
+        }, indent=2))
+        return
+
+    print(f"\nDataset:  {besd_path}")
+    print(f"Source:   besd")
+    print(f"Probes:   {n_probes:,}")
+    print(f"SNPs:     {n_snps:,}")
+    print(f"Assocs:   {total_assocs:,}")
+
+    w = _DIST_COL_W
+    hdr = f"\n{'':22}{'min':>{w}}{'p25':>{w}}{'p50':>{w}}{'p75':>{w}}{'max':>{w}}{'mean':>{w}}"
+    print(hdr)
+    print("-" * (22 + w * 6))
+    print(_fmt_dist_row("snp_count (stored)", dist_stored))
+    print()
 
 
 def main():
@@ -90,13 +304,13 @@ def main():
 
     # Input source: either BESD files or SQLite index
     input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument('--beqtl-summary',
+    input_group.add_argument('--besd',
                         help='Path to BESD files (without extension) - reads from binary files')
-    input_group.add_argument('--besd-index',
-                        help='Path to SQLite index database file (created with --index) - reads from database')
+    input_group.add_argument('--db',
+                        help='Path to SQLite index database file - reads from database')
 
-    parser.add_argument('--index',
-                        help='Create SQLite index database at specified path (e.g. data/westra.db). Requires --beqtl-summary.')
+    parser.add_argument('--build-db', dest='build_db',
+                        help='Create SQLite index database at specified path (e.g. data/westra.db). Requires --besd.')
     parser.add_argument('--n-mode', choices=['scalar', 'vector'], default='scalar',
                         help='Sample-size storage mode: scalar (one n per probe) or vector (one n per SNP-probe pair). Default: scalar.')
     parser.add_argument('--sample-size', type=int, default=None,
@@ -139,25 +353,37 @@ def main():
                         help='Gene name(s) to query (comma-separated for multiple)')
     parser.add_argument('--out',
                         help='Output file prefix')
+    parser.add_argument('--info', action='store_true',
+                        help='Print dataset summary (traits, SNPs, tier breakdown). Use with --db or --besd.')
+    parser.add_argument('--json', action='store_true', dest='as_json',
+                        help='Emit --info output as JSON instead of a human-readable table.')
 
     args = parser.parse_args()
 
+    # Handle --info mode
+    if args.info:
+        if args.db:
+            _show_info_db(args.db, as_json=args.as_json)
+        else:
+            _show_info_besd(args.besd, as_json=args.as_json)
+        return
+
     # Handle indexing mode
-    if args.index:
-        if not args.beqtl_summary:
-            print("Error: --beqtl-summary is required when using --index", file=sys.stderr)
+    if args.build_db:
+        if not args.besd:
+            print("Error: --besd is required when using --build-db", file=sys.stderr)
             sys.exit(1)
         try:
-            print(f"Building SQLite index from BESD files: {args.beqtl_summary}")
-            builder = BESDIndexBuilder(args.index)
+            print(f"Building SQLite index from BESD files: {args.besd}")
+            builder = BESDIndexBuilder(args.build_db)
             builder.build(
-                args.beqtl_summary,
+                args.besd,
                 force=False,
                 n_mode=args.n_mode,
                 sample_size=args.sample_size,
                 trait_variance_path=args.trait_variance,
             )
-            print(f"Index created: {args.index}")
+            print(f"Index created: {args.build_db}")
             return
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -171,13 +397,13 @@ def main():
         sys.exit(1)
 
     # Determine data source
-    if args.besd_index:
-        print(f"Using SQLite index: {args.besd_index}")
-        query_engine = BESDQueryIndex(args.besd_index, original_scale=args.original_scale)
+    if args.db:
+        print(f"Using SQLite index: {args.db}")
+        query_engine = BESDQueryIndex(args.db, original_scale=args.original_scale)
         is_index = True
     else:
-        print(f"Using BESD files: {args.beqtl_summary}")
-        query_engine = BESDQueryEngine(args.beqtl_summary)
+        print(f"Using BESD files: {args.besd}")
+        query_engine = BESDQueryEngine(args.besd)
         is_index = False
 
     # Determine query type and validate arguments
@@ -395,8 +621,9 @@ def import_gwas_ssf_main() -> None:
         help='Path to trait annotation TSV file (required columns: file_path, trait_id, trait_name)',
     )
     parser.add_argument(
-        '--ld-reference', required=True, dest='ld_reference',
-        help='Prefix for plink2-format LD reference panel (--pfile prefix)',
+        '--ld-reference', required=False, default=None, dest='ld_reference',
+        help='Prefix for plink2-format LD reference panel (--pfile prefix). '
+             'Optional: if omitted, significant trans peaks are counted using a distance-based approximation.',
     )
     parser.add_argument(
         '--output', default=None,
