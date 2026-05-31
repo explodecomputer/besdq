@@ -55,10 +55,14 @@ MOCK_STUDY_PAGE_2 = {
 }
 
 GENE_ANNOTATION_CONTENT = (
-    "gene_name\tchr\tbp\n"
-    "IL10\t1\t206941637\n"
-    "TNF\t6\t31575567\n"
-    "BRCA1\t17\t43044295\n"
+    "gene_name\tchr\tbp\tcanonical\n"
+    "IL10\t1\t206941637\t\n"
+    "TNF\t6\t31575567\t\n"
+    "BRCA1\t17\t43044295\t\n"
+    # alias entries (gene_name differs from canonical)
+    "IL1RA\t2\t113117981\tIL1RN\n"   # IL1RA is an alias for IL1RN
+    "TNFA\t6\t31575567\tTNF\n"        # TNFA is a previous symbol for TNF
+    "IL1RN\t2\t113117981\t\n"         # canonical entry for IL1RN itself
 )
 
 
@@ -311,6 +315,77 @@ class TestParseGene(unittest.TestCase):
         self.assertEqual(_parse_gene_symbol("TNF"), "TNF")
         self.assertEqual(_parse_gene_symbol(""), "")
         self.assertEqual(_parse_gene_symbol("  BRCA1  variant"), "BRCA1")
+
+    def test_alias_resolves_to_canonical_symbol(self):
+        """IL1Ra (alias) resolves to IL1RN coordinates; gene field is canonical 'IL1RN'."""
+        ann_path = self._write_gene_annotation()
+        il1ra_page = {
+            "_embedded": {
+                "studies": [{
+                    "accessionId": "GCST_IL1",
+                    "summaryStatistics": "ftp://ftp.ebi.ac.uk/pub/databases/gwas/GCST_IL1",
+                    "reportedTrait": "IL1Ra expression at baseline",
+                }]
+            },
+            "page": {"totalPages": 1, "number": 0},
+        }
+        try:
+            with mock.patch('besdq.discover._requests') as mock_req:
+                mock_req.get.return_value.status_code = 200
+                mock_req.get.return_value.json.return_value = il1ra_page
+                rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
+            self.assertEqual(rows[0]['gene'], 'IL1RN')       # canonical symbol returned
+            self.assertEqual(rows[0]['trait_chr'], '2')
+            self.assertEqual(rows[0]['trait_bp'], '113117981')
+        finally:
+            Path(ann_path).unlink(missing_ok=True)
+
+    def test_case_insensitive_lookup(self):
+        """'il10' and 'IL10' and 'Il10' all resolve to the same entry."""
+        ann_path = self._write_gene_annotation()
+        for variant in ('IL10', 'il10', 'Il10'):
+            page = {
+                "_embedded": {
+                    "studies": [{
+                        "accessionId": "GCST_CI",
+                        "summaryStatistics": "ftp://ftp.ebi.ac.uk/s",
+                        "reportedTrait": f"{variant} expression",
+                    }]
+                },
+                "page": {"totalPages": 1, "number": 0},
+            }
+            try:
+                with mock.patch('besdq.discover._requests') as mock_req:
+                    mock_req.get.return_value.status_code = 200
+                    mock_req.get.return_value.json.return_value = page
+                    rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
+                self.assertEqual(rows[0]['trait_chr'], '1', f"Failed for variant {variant!r}")
+            finally:
+                pass
+        Path(ann_path).unlink(missing_ok=True)
+
+    def test_previous_symbol_resolves_to_canonical(self):
+        """TNFA (previous symbol for TNF) resolves to TNF coordinates."""
+        ann_path = self._write_gene_annotation()
+        page = {
+            "_embedded": {
+                "studies": [{
+                    "accessionId": "GCST_TNF",
+                    "summaryStatistics": "ftp://ftp.ebi.ac.uk/s",
+                    "reportedTrait": "TNFA expression",
+                }]
+            },
+            "page": {"totalPages": 1, "number": 0},
+        }
+        try:
+            with mock.patch('besdq.discover._requests') as mock_req:
+                mock_req.get.return_value.status_code = 200
+                mock_req.get.return_value.json.return_value = page
+                rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
+            self.assertEqual(rows[0]['gene'], 'TNF')
+            self.assertEqual(rows[0]['trait_chr'], '6')
+        finally:
+            Path(ann_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

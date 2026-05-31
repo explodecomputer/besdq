@@ -72,7 +72,16 @@ def _parse_gene_symbol(trait_name: str) -> str:
 
 
 def load_gene_annotation(path: str) -> Dict[str, Dict]:
-    """Load gene annotation TSV (columns: gene_name, chr, bp) keyed by gene_name."""
+    """Load gene annotation TSV into a case-insensitive lookup dict.
+
+    Required columns: gene_name, chr, bp.
+    Optional column:  canonical — the preferred HGNC symbol for this entry.
+                      Present on alias rows; absent/empty on canonical rows.
+
+    Keys are lowercased gene_name values so lookups are case-insensitive.
+    Each value carries 'chr', 'bp', and 'canonical' (the symbol to store in
+    the output; equals gene_name when the canonical column is absent/empty).
+    """
     from pathlib import Path
     p = Path(path)
     if not p.exists():
@@ -84,16 +93,27 @@ def load_gene_annotation(path: str) -> Dict[str, Dict]:
         for col in ('gene_name', 'chr', 'bp'):
             if col not in col_idx:
                 raise ValueError(f"Gene annotation TSV missing required column: '{col}'")
+        canonical_col = col_idx.get('canonical')
         for line in fh:
             parts = line.rstrip('\n').split('\t')
             if not line.strip():
                 continue
-            name = parts[col_idx['gene_name']].strip() if col_idx['gene_name'] < len(parts) else ''
-            if name:
-                gene_map[name] = {
-                    'chr': parts[col_idx['chr']].strip() if col_idx['chr'] < len(parts) else '',
-                    'bp': parts[col_idx['bp']].strip() if col_idx['bp'] < len(parts) else '',
-                }
+            def _get(col: str) -> str:
+                i = col_idx.get(col)
+                return parts[i].strip() if i is not None and i < len(parts) else ''
+            name = _get('gene_name')
+            if not name:
+                continue
+            canonical = (
+                parts[canonical_col].strip()
+                if canonical_col is not None and canonical_col < len(parts)
+                else ''
+            ) or name
+            gene_map[name.lower()] = {
+                'chr': _get('chr'),
+                'bp': _get('bp'),
+                'canonical': canonical,
+            }
     return gene_map
 
 
@@ -123,10 +143,11 @@ def discover_study(
         if parse_gene:
             symbol = _parse_gene_symbol(trait_name)
             if symbol:
-                if symbol in gene_map:
-                    gene = symbol
-                    trait_chr = gene_map[symbol].get("chr", "")
-                    trait_bp = gene_map[symbol].get("bp", "")
+                entry = gene_map.get(symbol.lower())
+                if entry:
+                    gene = entry['canonical']
+                    trait_chr = entry.get("chr", "")
+                    trait_bp = entry.get("bp", "")
                 else:
                     print(
                         f"WARNING: gene '{symbol}' from '{trait_name}' not found in annotation",
