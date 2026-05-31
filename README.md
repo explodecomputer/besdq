@@ -152,22 +152,22 @@ besdq-discover-study 38714679 --output discovery.tsv
 
 Queries the EBI GWAS Catalog v2 API for all GCST accessions under PMID 38714679 and writes a discovery TSV with columns: `pmid`, `gcst_id`, `file_path` (harmonised FTP URL), `trait_name`, `gene`, `trait_chr`, `trait_bp`, `context`.
 
-To parse gene symbols from trait descriptions and map them to chromosomal positions:
+To parse gene symbols from trait descriptions and map them to chromosomal positions using a local Ensembl annotation file:
 
 ```bash
 besdq-discover-study 38714679 \
   --parse-gene \
   --gene-annotation resources/ensembl_gene_tss_hg38.tsv \
-  --output discovery.tsv
+  --output data/38714679/discovery.tsv
 ```
 
-A pre-built gene annotation file for GRCh38 is included at `resources/ensembl_gene_tss_hg38.tsv` (41,333 HGNC symbols with canonical TSS positions, sourced from [Ensembl BioMart](https://www.ensembl.org/biomart) release 115). The file has three tab-separated columns: `gene_name`, `chr`, `bp` (TSS position). To regenerate or update it for a newer Ensembl release, see `scripts/fetch_ensembl_gene_tss.py`.
+The gene annotation TSV requires columns `gene_name`, `chr`, `bp` (TSS position). A suitable file can be exported from [Ensembl BioMart](https://www.ensembl.org/biomart).
 
 ### 2. Stage 1: download, filter, write intermediate file pairs
 
 ```bash
-besdq-build-stage1 discovery.tsv \
-  --workdir /data/workdir \
+besdq-build-stage1 data/38714679/discovery.tsv \
+  --workdir data/38714679 \
   --parallel-downloads 4
 ```
 
@@ -194,7 +194,7 @@ For each trait, Stage 1 streams the harmonised GWAS-SSF file, applies the three-
 ### 3. Stage 2: collate intermediates into a queryable index
 
 ```bash
-besdq-build-stage2 /data/workdir/38714679/ study_38714679.db
+besdq-build-stage2 data/38714679/38714679 study_38714679.db
 ```
 
 Reads all completed `GCST*.tsv.gz` + `GCST*.yaml` pairs (skips `*.failed.yaml`) and writes a single queryable SQLite index. Always a clean rebuild — safe to re-run.
