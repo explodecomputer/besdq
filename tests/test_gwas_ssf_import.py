@@ -273,9 +273,11 @@ class TestSignificanceFilter(unittest.TestCase):
 class TestLdClumping(unittest.TestCase):
 
     def test_empty_candidates_skip_plink2(self):
-        from besdq.ld_clumping import clump_trans_peaks
+        from besdq.ld_clumping import clump_trans_peaks, ClumpResult
         result = clump_trans_peaks([], plink2_pfile='/fake/ref')
-        self.assertEqual(result, [])
+        self.assertIsInstance(result, ClumpResult)
+        self.assertEqual(result.rows, [])
+        self.assertEqual(result.peak_count, 0)
 
     def test_missing_plink2_raises_import_error(self):
         from besdq.ld_clumping import clump_trans_peaks
