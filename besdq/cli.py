@@ -104,6 +104,7 @@ def _distribution(values):
 
     return {
         'n': n,
+        'total': sum(vs),
         'min': vs_sorted[0],
         'p25': pct(25),
         'p50': pct(50),
@@ -121,9 +122,10 @@ def _fmt_dist_row(label: str, dist) -> str:
     w = _DIST_COL_W
     if dist is None:
         dash = f"{'—':>{w}}"
-        return f"{label:<22}" + dash * 6
+        return f"{label:<22}" + dash * 7
     return (
         f"{label:<22}"
+        f"{int(round(dist['total'])):>{w},}"
         f"{int(round(dist['min'])):>{w},}"
         f"{int(round(dist['p25'])):>{w},}"
         f"{int(round(dist['p50'])):>{w},}"
@@ -196,6 +198,13 @@ def _show_info_db(db_path: str, as_json: bool = False) -> None:
                 'n_sig_trans_peaks': dist_sig_peaks,
                 'n_sug_trans': dist_sug_trans,
             },
+            'totals': {
+                'snp_count_stored': dist_stored['total'] if dist_stored else None,
+                'n_source_snps': dist_source_snps['total'] if dist_source_snps else None,
+                'n_cis': dist_cis['total'] if dist_cis else None,
+                'n_sig_trans_peaks': dist_sig_peaks['total'] if dist_sig_peaks else None,
+                'n_sug_trans': dist_sug_trans['total'] if dist_sug_trans else None,
+            },
         }
         print(json.dumps(out, indent=2))
         return
@@ -232,8 +241,8 @@ def _show_info_db(db_path: str, as_json: bool = False) -> None:
 
     # Distribution table
     w = _DIST_COL_W
-    hdr = f"\n{'':22}{'min':>{w}}{'p25':>{w}}{'p50':>{w}}{'p75':>{w}}{'max':>{w}}{'mean':>{w}}"
-    sep = "-" * (22 + w * 6)
+    hdr = f"\n{'':22}{'total':>{w}}{'min':>{w}}{'p25':>{w}}{'p50':>{w}}{'p75':>{w}}{'max':>{w}}{'mean':>{w}}"
+    sep = "-" * (22 + w * 7)
     print(hdr)
     print(sep)
     print(_fmt_dist_row("snp_count (stored)", dist_stored))
