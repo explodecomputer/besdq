@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "BESD Query Contributors"}
 ]
-dependencies = ["numpy>=1.20", "PyYAML>=5.1"]
+dependencies = ["numpy>=1.20", "PyYAML>=5.1", "requests>=2.25"]
 
 [project.optional-dependencies]
 dev = ["black>=22.0", "flake8>=4.0"]
@@ -24,6 +24,9 @@ packages = ["besdq"]
 [project.scripts]
 besdq = "besdq.cli:main"
 import-gwas-ssf = "besdq.cli:import_gwas_ssf_main"
+besdq-discover-study = "besdq.cli:discover_study_main"
+besdq-build-stage1 = "besdq.cli:build_stage1_main"
+besdq-build-stage2 = "besdq.cli:build_stage2_main"
 
 [tool.pytest.ini_options]
 markers = [

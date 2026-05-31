@@ -1,5 +1,7 @@
 """Two-pass GWAS-SSF builder: parallel Pass 1 (filtering) + serial Pass 2 (index)."""
 
+import datetime
+import gzip
 import json
 import sqlite3
 import sys
@@ -156,6 +158,37 @@ def _snp_sort_key(snp_key: str) -> Tuple:
         return (1, chr_str, bp)
 
 
+# Columns written to intermediate TSV.gz files by Stage 1
+INTERMEDIATE_TSV_COLUMNS = ['chr', 'bp', 'a1', 'a2', 'rsid', 'eaf', 'beta', 'se', 'p']
+
+
+def read_intermediate_tsv(tsv_gz_path: str) -> List[GwasSsfRow]:
+    """Read filtered rows from an intermediate TSV.gz produced by Stage 1."""
+    rows = []
+    with gzip.open(tsv_gz_path, 'rt') as fh:
+        header = fh.readline().rstrip('\n').split('\t')
+        col_idx = {n: i for i, n in enumerate(header)}
+        for line in fh:
+            parts = line.rstrip('\n').split('\t')
+            if not line.strip():
+                continue
+            try:
+                rows.append(GwasSsfRow(
+                    chr=parts[col_idx['chr']],
+                    bp=int(parts[col_idx['bp']]),
+                    a1=parts[col_idx['a1']],
+                    a2=parts[col_idx['a2']],
+                    rsid=parts[col_idx['rsid']] or None,
+                    eaf=float(parts[col_idx['eaf']]),
+                    beta=float(parts[col_idx['beta']]),
+                    se=float(parts[col_idx['se']]),
+                    p=float(parts[col_idx['p']]) if 'p' in col_idx else 0.0,
+                ))
+            except (ValueError, IndexError, KeyError):
+                continue
+    return rows
+
+
 class GwasSsfIndexBuilder:
     """Build a BESD-compatible SQLite index from GWAS-SSF files."""
 
@@ -207,8 +240,122 @@ class GwasSsfIndexBuilder:
                     trait_results[r.trait.trait_id] = r
                     _log(f"  {r.trait.trait_id}: {r.n_retained}/{r.n_total_read} rows retained")
 
+        build_params = {
+            'cis_radius': cis_radius,
+            'sig_threshold': sig_threshold,
+            'sug_threshold': sug_threshold,
+            'sig_radius': sig_radius,
+        }
+
         # ------- Pass 2: serial index construction -------
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        self._create_schema(cursor)
+        self._run_pass2(conn, cursor, traits, trait_results, build_params)
+        conn.close()
+
+    def build_from_intermediates(
+        self,
+        workdir: str,
+    ) -> None:
+        """Build SQLite index from Stage 1 intermediate file pairs in workdir.
+
+        Discovers all GCST*.yaml (skips *.failed.yaml), loads paired TSV.gz,
+        and writes a clean SQLite index at self.db_path.
+        """
+        import yaml
+
+        workdir_path = Path(workdir)
+        if not workdir_path.exists():
+            raise FileNotFoundError(f"Workdir not found: {workdir}")
+
+        yaml_files = sorted(
+            p for p in workdir_path.glob("*.yaml")
+            if not p.name.endswith(".failed.yaml")
+        )
+        if not yaml_files:
+            raise ValueError(f"No completed intermediate YAML files found in {workdir}")
+
+        traits: List[TraitConfig] = []
+        trait_results: Dict[str, _TraitResult] = {}
+        build_params: Optional[Dict] = None
+
+        for yaml_path in yaml_files:
+            with open(yaml_path, 'r') as fh:
+                meta = yaml.safe_load(fh) or {}
+
+            trait_id = meta.get('trait_id', yaml_path.stem)
+            tsv_gz_path = yaml_path.parent / f"{trait_id}.tsv.gz"
+            if not tsv_gz_path.exists():
+                _log(f"  WARNING: missing TSV for {trait_id}, skipping")
+                continue
+
+            trait_cfg = TraitConfig(
+                file_path=str(tsv_gz_path),
+                trait_id=trait_id,
+                trait_name=meta.get('trait_name', trait_id),
+                trait_chr=meta.get('trait_chr') or None,
+                trait_bp=meta.get('trait_bp') or None,
+                sample_size=None,
+                trait_var=meta.get('trait_var') or None,
+                gene=meta.get('gene') or None,
+                context=meta.get('context') or None,
+                study_metadata={},
+            )
+            traits.append(trait_cfg)
+
+            rows = read_intermediate_tsv(str(tsv_gz_path))
+            result = _TraitResult(
+                trait=trait_cfg,
+                rows=rows,
+                n_total_read=meta.get('n_total_read', len(rows)),
+                n_retained=len(rows),
+                estimated_trait_var=None,
+                n_cis=meta.get('n_cis', 0),
+                n_sig_trans_peaks=meta.get('n_sig_trans_peaks', 0),
+                n_sig_trans_peaks_approx=bool(meta.get('n_sig_trans_peaks_approx', False)),
+                n_sug_trans=meta.get('n_sug_trans', 0),
+            )
+            trait_results[trait_id] = result
+
+            if build_params is None:
+                build_params = {
+                    'cis_radius': meta.get('cis_radius', 1_000_000),
+                    'sig_threshold': meta.get('sig_threshold', 5e-8),
+                    'sug_threshold': meta.get('sug_threshold', 1e-4),
+                    'sig_radius': meta.get('sig_radius', 500_000),
+                }
+
+        if not traits:
+            raise ValueError("No valid traits loaded from intermediates")
+
+        _log(f"Stage 2: {len(traits)} traits loaded from intermediates")
+
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        self._create_schema(cursor)
+        self._run_pass2(conn, cursor, traits, trait_results, build_params or {})
+        conn.close()
+        _log(f"Stage 2 complete. Database written to {self.db_path}")
+
+    def _run_pass2(
+        self,
+        conn: sqlite3.Connection,
+        cursor: sqlite3.Cursor,
+        traits: List[TraitConfig],
+        trait_results: Dict[str, _TraitResult],
+        build_params: Dict,
+    ) -> None:
+        """Serial index construction: ESI, EPI, probe_data, and besd_meta."""
         _log("Pass 2: building index…")
+
+        cis_radius = build_params.get('cis_radius', 1_000_000)
+        sig_threshold = build_params.get('sig_threshold', 5e-8)
+        sug_threshold = build_params.get('sug_threshold', 1e-4)
+        sig_radius = build_params.get('sig_radius', 500_000)
 
         # Consolidate SNP universe across all traits, sorted stably
         all_snp_keys: set = set()
@@ -219,10 +366,6 @@ class GwasSsfIndexBuilder:
         sorted_keys = sorted(all_snp_keys, key=_snp_sort_key)
         snp_key_to_idx: Dict[str, int] = {k: i for i, k in enumerate(sorted_keys)}
         _log(f"  ESI size: {len(sorted_keys)} unique SNPs")
-
-        conn = sqlite3.connect(str(self.db_path))
-        cursor = conn.cursor()
-        self._create_schema(cursor)
 
         # Write ESI
         snp_data: Dict[str, dict] = {}
@@ -337,7 +480,6 @@ class GwasSsfIndexBuilder:
         cursor.execute("CREATE INDEX idx_epi_trait_id ON epi(trait_id)")
 
         conn.commit()
-        conn.close()
         _log(f"Pass 2 complete. Database written to {self.db_path}")
 
     def _create_schema(self, cursor: sqlite3.Cursor) -> None:
@@ -389,6 +531,5 @@ class GwasSsfIndexBuilder:
 
 
 def _log(msg: str) -> None:
-    import datetime
     ts = datetime.datetime.now().strftime('%H:%M:%S')
     print(f"[{ts}] {msg}", file=sys.stderr)

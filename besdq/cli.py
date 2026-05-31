@@ -713,5 +713,147 @@ def import_gwas_ssf_main() -> None:
         sys.exit(1)
 
 
+def discover_study_main() -> None:
+    """Entry point for discover-study command."""
+    parser = argparse.ArgumentParser(
+        prog='besdq-discover-study',
+        description='Query EBI GWAS Catalog for all studies under a PubMed ID',
+    )
+    parser.add_argument('pmid', help='PubMed ID (e.g. 38714679)')
+    parser.add_argument(
+        '--output', default=None,
+        help='Write TSV to this file instead of stdout',
+    )
+    parser.add_argument(
+        '--parse-gene', action='store_true', dest='parse_gene',
+        help='Extract gene symbol from trait name and map to chr/bp',
+    )
+    parser.add_argument(
+        '--gene-annotation', default=None, dest='gene_annotation',
+        help='Path to gene annotation TSV (columns: gene_name, chr, bp). Required with --parse-gene.',
+    )
+    args = parser.parse_args()
+
+    try:
+        from .discover import discover_study, write_discovery_tsv
+        rows = discover_study(
+            args.pmid,
+            parse_gene=args.parse_gene,
+            gene_annotation_path=args.gene_annotation,
+        )
+        write_discovery_tsv(rows, output=args.output)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def build_stage1_main() -> None:
+    """Entry point for build-stage1 command."""
+    parser = argparse.ArgumentParser(
+        prog='besdq-build-stage1',
+        description='Filter GWAS-SSF source files and write intermediate TSV+YAML pairs',
+    )
+    parser.add_argument('discovery_tsv', help='Discovery TSV from discover-study')
+    parser.add_argument('--workdir', required=True, help='Working directory for intermediates')
+    parser.add_argument(
+        '--parallel-downloads', type=int, default=1, dest='parallel_downloads',
+        help='Number of concurrent download+filter workers (default: 1)',
+    )
+    parser.add_argument(
+        '--sig-threshold', type=float, default=5e-8, dest='sig_threshold',
+        help='Genome-wide significance threshold (default: 5e-8)',
+    )
+    parser.add_argument(
+        '--sug-threshold', type=float, default=1e-4, dest='sug_threshold',
+        help='Suggestive significance threshold (default: 1e-4)',
+    )
+    parser.add_argument(
+        '--cis-radius', type=int, default=1_000_000, dest='cis_radius',
+        help='Cis window radius in bp (default: 1000000)',
+    )
+    parser.add_argument(
+        '--sig-radius', type=int, default=500_000, dest='sig_radius',
+        help='Significant trans window radius in bp (default: 500000)',
+    )
+    parser.add_argument(
+        '--ld-reference', default=None, dest='ld_reference',
+        help='Prefix for plink2-format LD reference panel',
+    )
+    parser.add_argument(
+        '--clump-r2', type=float, default=0.01, dest='clump_r2',
+        help='LD clumping r² threshold (default: 0.01)',
+    )
+    parser.add_argument(
+        '--clump-kb', type=int, default=10_000, dest='clump_kb',
+        help='LD clumping window in kb (default: 10000)',
+    )
+    parser.add_argument(
+        '--force-fallback', action='store_true', dest='force_fallback',
+        help='Always use Python streaming reader',
+    )
+    args = parser.parse_args()
+
+    try:
+        from .stage1 import Stage1Builder
+        builder = Stage1Builder()
+        builder.build(
+            discovery_tsv=args.discovery_tsv,
+            workdir=args.workdir,
+            parallel_downloads=args.parallel_downloads,
+            cis_radius=args.cis_radius,
+            sig_threshold=args.sig_threshold,
+            sug_threshold=args.sug_threshold,
+            plink2_pfile=args.ld_reference,
+            sig_radius=args.sig_radius,
+            clump_r2=args.clump_r2,
+            clump_kb=args.clump_kb,
+            force_fallback=args.force_fallback,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def build_stage2_main() -> None:
+    """Entry point for build-stage2 command."""
+    parser = argparse.ArgumentParser(
+        prog='besdq-build-stage2',
+        description='Collate Stage 1 intermediate files into a queryable SQLite index',
+    )
+    parser.add_argument(
+        'workdir_pmid',
+        help='Path to the workdir/<pmid>/ directory containing intermediate files',
+    )
+    parser.add_argument('output_db', help='Output SQLite database path')
+    args = parser.parse_args()
+
+    try:
+        from .gwas_ssf_builder import GwasSsfIndexBuilder
+        builder = GwasSsfIndexBuilder(args.output_db)
+        builder.build_from_intermediates(args.workdir_pmid)
+        print(f"Index written to: {args.output_db}", file=sys.stderr)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 if __name__ == '__main__':
     main()

@@ -20,8 +20,8 @@ class TraitConfig:
     trait_name: str
     trait_chr: Optional[str]
     trait_bp: Optional[int]
-    sample_size: int
-    trait_var: float
+    sample_size: Optional[int]
+    trait_var: Optional[float]
     gene: Optional[str]
     context: Optional[str]
     study_metadata: dict = field(default_factory=dict)
