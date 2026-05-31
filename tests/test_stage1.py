@@ -302,6 +302,41 @@ class TestStage1UrlDownload(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Issue #28 — Integration test (live EBI URL; gated by TEST_EBI_LIVE=1)
+# ---------------------------------------------------------------------------
+
+class TestStage1UrlLive(unittest.TestCase):
+
+    def _require_live(self):
+        if not os.environ.get('TEST_EBI_LIVE'):
+            self.skipTest("Set TEST_EBI_LIVE=1 to run live EBI URL integration tests")
+
+    def test_live_url_download_filter_delete(self):
+        """Stage 1 downloads a real EBI harmonised file, filters, deletes the download."""
+        self._require_live()
+        # A small known harmonised file from EBI GWAS Catalog
+        live_url = (
+            "https://ftp.ebi.ac.uk/pub/databases/gwas/summary_statistics/"
+            "GCST90275731/harmonised/GCST90275731.h.tsv.gz"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            disc_tsv = str(Path(tmpdir) / 'disc.tsv')
+            _write_discovery_tsv(disc_tsv, [{
+                'pmid': '38714679', 'gcst_id': 'GCST90275731',
+                'file_path': live_url,
+                'trait_name': 'Live test trait', 'gene': '', 'trait_chr': '4',
+                'trait_bp': '1000000', 'context': '',
+            }])
+            workdir = str(Path(tmpdir) / 'work')
+            counts = Stage1Builder().build(disc_tsv, workdir=workdir)
+
+        self.assertEqual(counts['completed'], 1)
+        # Download temp should be gone
+        dl_tmp = Path(workdir) / '38714679' / 'GCST90275731.download.tmp'
+        self.assertFalse(dl_tmp.exists())
+
+
+# ---------------------------------------------------------------------------
 # Issue #29 — Resumability
 # ---------------------------------------------------------------------------
 
