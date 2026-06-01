@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -59,11 +60,53 @@ GENE_ANNOTATION_CONTENT = (
     "IL10\t1\t206941637\t\n"
     "TNF\t6\t31575567\t\n"
     "BRCA1\t17\t43044295\t\n"
-    # alias entries (gene_name differs from canonical)
-    "IL1RA\t2\t113117981\tIL1RN\n"   # IL1RA is an alias for IL1RN
-    "TNFA\t6\t31575567\tTNF\n"        # TNFA is a previous symbol for TNF
-    "IL1RN\t2\t113117981\t\n"         # canonical entry for IL1RN itself
+    "IL1RA\t2\t113117981\tIL1RN\n"
+    "TNFA\t6\t31575567\tTNF\n"
+    "IL1RN\t2\t113117981\t\n"
 )
+
+
+# ---------------------------------------------------------------------------
+# Mock helpers
+# ---------------------------------------------------------------------------
+
+def _api_response(page_data: dict):
+    m = mock.MagicMock()
+    m.status_code = 200
+    m.json.return_value = page_data
+    return m
+
+
+def _meta_yaml_response(sample_size: int = 1060):
+    m = mock.MagicMock()
+    m.status_code = 200
+    m.text = f"samples:\n- sample_size: {sample_size}\n"
+    return m
+
+
+def _meta_yaml_404():
+    return mock.MagicMock(status_code=404, text="Not Found")
+
+
+def _side_effects_for_page(page_data: dict, sample_size: int = 1060):
+    """API page response + one meta YAML per study.
+
+    Valid for single-page calls where all API pages are fetched before
+    _fetch_sample_size is called. For multi-page tests, build the sequence
+    manually (all API pages first, then all meta YAMLs).
+    """
+    n = len(page_data["_embedded"]["studies"])
+    return [_api_response(page_data)] + [_meta_yaml_response(sample_size)] * n
+
+
+@contextmanager
+def patch_requests(side_effects):
+    """Patch _requests and _REQUESTS_AVAILABLE in besdq.discover together."""
+    with mock.patch('besdq.discover._requests') as mock_req, \
+         mock.patch('besdq.discover._REQUESTS_AVAILABLE', True):
+        mock_req.RequestException = Exception
+        mock_req.get.side_effect = list(side_effects)
+        yield mock_req
 
 
 # ---------------------------------------------------------------------------
@@ -72,24 +115,12 @@ GENE_ANNOTATION_CONTENT = (
 
 class TestDiscoverStudy(unittest.TestCase):
 
-    def _mock_responses(self, pages):
-        """Return a mock for requests.get that serves each page in order."""
-        responses = []
-        for page_data in pages:
-            m = mock.MagicMock()
-            m.status_code = 200
-            m.json.return_value = page_data
-            responses.append(m)
-        return responses
-
     def test_single_page(self):
         single_page = {
             "_embedded": {"studies": MOCK_STUDY_PAGE_1["_embedded"]["studies"]},
             "page": {"totalPages": 1, "number": 0, "size": 2, "totalElements": 2},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = single_page
+        with patch_requests(_side_effects_for_page(single_page)):
             rows = discover_study("12345")
 
         self.assertEqual(len(rows), 2)
@@ -99,12 +130,17 @@ class TestDiscoverStudy(unittest.TestCase):
 
     def test_pagination(self):
         """Studies beyond page 0 are included."""
-        responses = self._mock_responses([MOCK_STUDY_PAGE_1, MOCK_STUDY_PAGE_2])
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.side_effect = [
-                mock.MagicMock(status_code=200, json=lambda: MOCK_STUDY_PAGE_1),
-                mock.MagicMock(status_code=200, json=lambda: MOCK_STUDY_PAGE_2),
-            ]
+        # query_ebi_studies fetches all API pages first, then _fetch_sample_size
+        # is called per study — so API responses come before meta YAML responses.
+        all_studies = (
+            MOCK_STUDY_PAGE_1["_embedded"]["studies"] +
+            MOCK_STUDY_PAGE_2["_embedded"]["studies"]
+        )
+        side_effects = (
+            [_api_response(MOCK_STUDY_PAGE_1), _api_response(MOCK_STUDY_PAGE_2)] +
+            [_meta_yaml_response() for _ in all_studies]
+        )
+        with patch_requests(side_effects):
             rows = discover_study("12345")
 
         self.assertEqual(len(rows), 3)
@@ -129,11 +165,8 @@ class TestDiscoverStudy(unittest.TestCase):
             "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
             "page": {"totalPages": 1, "number": 0},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = single_page
+        with patch_requests(_side_effects_for_page(single_page)):
             rows = discover_study("12345")
-
         self.assertIn('/harmonised/GCST001.h.tsv.gz', rows[0]['file_path'])
 
     def test_trait_name_from_reported_trait(self):
@@ -141,11 +174,8 @@ class TestDiscoverStudy(unittest.TestCase):
             "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
             "page": {"totalPages": 1, "number": 0},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = single_page
+        with patch_requests(_side_effects_for_page(single_page)):
             rows = discover_study("12345")
-
         self.assertEqual(rows[0]['trait_name'], 'IL10 expression at baseline')
 
     def test_gene_chr_bp_empty_without_parse_gene(self):
@@ -153,11 +183,8 @@ class TestDiscoverStudy(unittest.TestCase):
             "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
             "page": {"totalPages": 1, "number": 0},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = single_page
+        with patch_requests(_side_effects_for_page(single_page)):
             rows = discover_study("12345")
-
         self.assertEqual(rows[0]['gene'], '')
         self.assertEqual(rows[0]['trait_chr'], '')
         self.assertEqual(rows[0]['trait_bp'], '')
@@ -167,56 +194,64 @@ class TestDiscoverStudy(unittest.TestCase):
             "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
             "page": {"totalPages": 1, "number": 0},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = single_page
+        with patch_requests(_side_effects_for_page(single_page)):
             rows = discover_study("12345")
 
         buf = io.StringIO()
         with mock.patch('sys.stdout', buf):
             write_discovery_tsv(rows)
         lines = buf.getvalue().strip().split('\n')
-        header_cols = lines[0].split('\t')
-        self.assertEqual(header_cols, DISCOVERY_TSV_COLUMNS)
+        self.assertEqual(lines[0].split('\t'), DISCOVERY_TSV_COLUMNS)
 
     def test_output_to_file(self):
         single_page = {
             "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
             "page": {"totalPages": 1, "number": 0},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = single_page
+        with patch_requests(_side_effects_for_page(single_page)):
             rows = discover_study("12345")
 
         with tempfile.NamedTemporaryFile(mode='r', suffix='.tsv', delete=False) as f:
             out_path = f.name
         try:
             write_discovery_tsv(rows, output=out_path)
-            with open(out_path) as f:
-                content = f.read()
+            content = Path(out_path).read_text()
             self.assertIn('GCST001', content)
             self.assertIn('\t'.join(DISCOVERY_TSV_COLUMNS), content)
         finally:
             Path(out_path).unlink(missing_ok=True)
 
     def test_http_error_raises_clear_message(self):
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 404
-            mock_req.get.return_value.text = 'Not Found'
-            mock_req.RequestException = Exception
+        error_resp = mock.MagicMock(status_code=404, text='Not Found')
+        with patch_requests([error_resp]):
             with self.assertRaises(RuntimeError) as cm:
                 discover_study("99999")
         self.assertIn('404', str(cm.exception))
+
+    def test_sample_size_populated_from_meta_yaml(self):
+        single_page = {
+            "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
+            "page": {"totalPages": 1, "number": 0},
+        }
+        with patch_requests(_side_effects_for_page(single_page, sample_size=575)):
+            rows = discover_study("12345")
+        self.assertEqual(rows[0]['sample_size'], 575)
+
+    def test_sample_size_empty_when_meta_yaml_unavailable(self):
+        single_page = {
+            "_embedded": {"studies": [MOCK_STUDY_PAGE_1["_embedded"]["studies"][0]]},
+            "page": {"totalPages": 1, "number": 0},
+        }
+        with patch_requests([_api_response(single_page), _meta_yaml_404()]):
+            rows = discover_study("12345")
+        self.assertEqual(rows[0]['sample_size'], '')
 
     def test_no_studies_returns_empty_list(self):
         empty_page = {
             "_embedded": {"studies": []},
             "page": {"totalPages": 1, "number": 0},
         }
-        with mock.patch('besdq.discover._requests') as mock_req:
-            mock_req.get.return_value.status_code = 200
-            mock_req.get.return_value.json.return_value = empty_page
+        with patch_requests([_api_response(empty_page)]):
             rows = discover_study("00000")
         self.assertEqual(rows, [])
 
@@ -244,9 +279,7 @@ class TestParseGene(unittest.TestCase):
             "page": {"totalPages": 1, "number": 0},
         }
         try:
-            with mock.patch('besdq.discover._requests') as mock_req:
-                mock_req.get.return_value.status_code = 200
-                mock_req.get.return_value.json.return_value = single_page
+            with patch_requests(_side_effects_for_page(single_page)):
                 rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
             self.assertEqual(rows[0]['gene'], 'IL10')
             self.assertEqual(rows[0]['trait_chr'], '1')
@@ -267,16 +300,11 @@ class TestParseGene(unittest.TestCase):
             "page": {"totalPages": 1, "number": 0},
         }
         try:
-            with mock.patch('besdq.discover._requests') as mock_req:
-                mock_req.get.return_value.status_code = 200
-                mock_req.get.return_value.json.return_value = unknown_study_page
-                import sys as _sys
-                with mock.patch.object(_sys, 'stderr') as mock_err:
-                    rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
+            with patch_requests(_side_effects_for_page(unknown_study_page)):
+                rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
         finally:
             Path(ann_path).unlink(missing_ok=True)
 
-        # Row still emitted
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['gene'], '')
         self.assertEqual(rows[0]['trait_chr'], '')
@@ -289,18 +317,15 @@ class TestParseGene(unittest.TestCase):
             "page": {"totalPages": 1, "number": 0},
         }
         try:
-            with mock.patch('besdq.discover._requests') as mock_req:
-                mock_req.get.return_value.status_code = 200
-                mock_req.get.return_value.json.return_value = single_page
+            with patch_requests(_side_effects_for_page(single_page)):
                 rows = discover_study("12345", parse_gene=False, gene_annotation_path=ann_path)
-            # Without parse_gene, gene is always empty
             self.assertEqual(rows[0]['gene'], '')
         finally:
             Path(ann_path).unlink(missing_ok=True)
 
     def test_gene_annotation_missing_column_raises(self):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.tsv', delete=False) as f:
-            f.write("gene_name\tchr\n")  # missing 'bp'
+            f.write("gene_name\tchr\n")
             f.write("IL10\t1\n")
             bad_path = f.name
         try:
@@ -317,7 +342,6 @@ class TestParseGene(unittest.TestCase):
         self.assertEqual(_parse_gene_symbol("  BRCA1  variant"), "BRCA1")
 
     def test_alias_resolves_to_canonical_symbol(self):
-        """IL1Ra (alias) resolves to IL1RN coordinates; gene field is canonical 'IL1RN'."""
         ann_path = self._write_gene_annotation()
         il1ra_page = {
             "_embedded": {
@@ -330,42 +354,35 @@ class TestParseGene(unittest.TestCase):
             "page": {"totalPages": 1, "number": 0},
         }
         try:
-            with mock.patch('besdq.discover._requests') as mock_req:
-                mock_req.get.return_value.status_code = 200
-                mock_req.get.return_value.json.return_value = il1ra_page
+            with patch_requests(_side_effects_for_page(il1ra_page)):
                 rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
-            self.assertEqual(rows[0]['gene'], 'IL1RN')       # canonical symbol returned
+            self.assertEqual(rows[0]['gene'], 'IL1RN')
             self.assertEqual(rows[0]['trait_chr'], '2')
             self.assertEqual(rows[0]['trait_bp'], '113117981')
         finally:
             Path(ann_path).unlink(missing_ok=True)
 
     def test_case_insensitive_lookup(self):
-        """'il10' and 'IL10' and 'Il10' all resolve to the same entry."""
         ann_path = self._write_gene_annotation()
-        for variant in ('IL10', 'il10', 'Il10'):
-            page = {
-                "_embedded": {
-                    "studies": [{
-                        "accessionId": "GCST_CI",
-                        "summaryStatistics": "ftp://ftp.ebi.ac.uk/s",
-                        "reportedTrait": f"{variant} expression",
-                    }]
-                },
-                "page": {"totalPages": 1, "number": 0},
-            }
-            try:
-                with mock.patch('besdq.discover._requests') as mock_req:
-                    mock_req.get.return_value.status_code = 200
-                    mock_req.get.return_value.json.return_value = page
+        try:
+            for variant in ('IL10', 'il10', 'Il10'):
+                page = {
+                    "_embedded": {
+                        "studies": [{
+                            "accessionId": "GCST_CI",
+                            "summaryStatistics": "ftp://ftp.ebi.ac.uk/s",
+                            "reportedTrait": f"{variant} expression",
+                        }]
+                    },
+                    "page": {"totalPages": 1, "number": 0},
+                }
+                with patch_requests(_side_effects_for_page(page)):
                     rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
                 self.assertEqual(rows[0]['trait_chr'], '1', f"Failed for variant {variant!r}")
-            finally:
-                pass
-        Path(ann_path).unlink(missing_ok=True)
+        finally:
+            Path(ann_path).unlink(missing_ok=True)
 
     def test_previous_symbol_resolves_to_canonical(self):
-        """TNFA (previous symbol for TNF) resolves to TNF coordinates."""
         ann_path = self._write_gene_annotation()
         page = {
             "_embedded": {
@@ -378,9 +395,7 @@ class TestParseGene(unittest.TestCase):
             "page": {"totalPages": 1, "number": 0},
         }
         try:
-            with mock.patch('besdq.discover._requests') as mock_req:
-                mock_req.get.return_value.status_code = 200
-                mock_req.get.return_value.json.return_value = page
+            with patch_requests(_side_effects_for_page(page)):
                 rows = discover_study("12345", parse_gene=True, gene_annotation_path=ann_path)
             self.assertEqual(rows[0]['gene'], 'TNF')
             self.assertEqual(rows[0]['trait_chr'], '6')
@@ -405,8 +420,9 @@ class TestDiscoverStudyLive(unittest.TestCase):
         for row in rows:
             self.assertTrue(row['gcst_id'].startswith('GCST'))
             self.assertIn('.h.tsv.gz', row['file_path'])
+            self.assertIsInstance(row['sample_size'], int)
+            self.assertGreater(row['sample_size'], 0)
         gcst_ids = {r['gcst_id'] for r in rows}
-        # Spot-check a few known accessions from this publication
         self.assertTrue(any(g.startswith('GCST') for g in gcst_ids))
 
 

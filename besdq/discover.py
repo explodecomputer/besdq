@@ -7,6 +7,7 @@ try:
     import requests as _requests
     _REQUESTS_AVAILABLE = True
 except ImportError:
+    _requests = None  # type: ignore[assignment]
     _REQUESTS_AVAILABLE = False
 
 
@@ -15,7 +16,7 @@ _EBI_PAGE_SIZE = 100
 
 DISCOVERY_TSV_COLUMNS = [
     "pmid", "gcst_id", "file_path", "trait_name",
-    "gene", "trait_chr", "trait_bp", "context",
+    "gene", "trait_chr", "trait_bp", "context", "sample_size",
 ]
 
 
@@ -64,6 +65,42 @@ def _harmonised_url(study: Dict) -> str:
     if not summary_stats or not accession_id:
         return ""
     return f"{summary_stats}/harmonised/{accession_id}.h.tsv.gz"
+
+
+def _fetch_sample_size(harmonised_url: str) -> Optional[int]:
+    """Fetch the EBI meta YAML for a harmonised GWAS-SSF file and return total sample size.
+
+    The meta YAML lives at <harmonised_url>-meta.yaml. Sample size is summed
+    across all entries in the 'samples' list (handles multi-cohort studies).
+    Returns None if the file is unavailable or sample_size is absent.
+    """
+    if not harmonised_url:
+        return None
+    _require_requests()
+    try:
+        import yaml as _yaml
+    except ImportError:
+        return None
+    meta_url = harmonised_url + "-meta.yaml"
+    try:
+        resp = _requests.get(meta_url, timeout=30)
+    except _requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        meta = _yaml.safe_load(resp.text)
+    except Exception:
+        return None
+    samples = meta.get("samples") if isinstance(meta, dict) else None
+    if not samples:
+        return None
+    total = 0
+    for s in samples:
+        n = s.get("sample_size")
+        if isinstance(n, (int, float)) and n > 0:
+            total += int(n)
+    return total if total > 0 else None
 
 
 def _parse_gene_symbol(trait_name: str) -> str:
@@ -154,6 +191,13 @@ def discover_study(
                         file=sys.stderr,
                     )
 
+        sample_size = _fetch_sample_size(file_path)
+        if sample_size is None:
+            print(
+                f"WARNING: could not retrieve sample_size for {gcst_id} — trait_var will not be estimated",
+                file=sys.stderr,
+            )
+
         rows.append({
             "pmid": pmid,
             "gcst_id": gcst_id,
@@ -163,6 +207,7 @@ def discover_study(
             "trait_chr": trait_chr,
             "trait_bp": trait_bp,
             "context": "",
+            "sample_size": sample_size if sample_size is not None else "",
         })
     return rows
 
