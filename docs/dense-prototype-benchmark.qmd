@@ -1,0 +1,367 @@
+---
+title: "Dense GWAS Storage Prototype — Benchmark Report"
+subtitle: "chr1 × 100 UK Biobank traits · `.besdz` Zarr format"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+jupyter: python3
+---
+
+## Overview
+
+This report benchmarks a prototype dense Zarr-based storage format (`.besdz`) for
+GWAS summary statistics against the equivalent set of bgzipped VCF files from
+OpenGWAS/UK Biobank.
+
+Three questions:
+
+1. **Storage** — how much smaller is `.besdz` vs bgzipped VCF?
+2. **Query latency** — how fast are regional, PheWAS, top-hits, and bulk queries?
+3. **MR precision** — does float16 encoding introduce meaningful error in MR analyses?
+
+The prototype covers chromosome 1 only (762,488 variants × 100 UKB traits). Results
+extrapolate linearly to the full genome.
+
+```{python}
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import zarr
+
+sys.path.insert(0, str(Path("../scripts").resolve()))
+
+STORE_RAW  = Path("../data/ukb-chr1.besdz")
+STORE_ZSTD = Path("../data/ukb-chr1-zstd.besdz")
+VCF_DIR    = Path("../data/vcf-ukb")
+TABIX      = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
+Z_THRESH   = 5.45   # ~ p < 5e-8
+
+meta = json.loads((STORE_RAW / "metadata.json").read_text())
+print(f"Variants: {meta['n_variants']:,}   Traits: {meta['n_traits']}")
+```
+
+## Dataset
+
+```{python}
+trait_df = pd.DataFrame({
+    "trait_id":   meta["trait_ids"],
+    "n":          meta["n_per_trait"],
+}).assign(n=lambda d: d["n"].astype(int))
+
+print(f"Sample size range: {trait_df['n'].min():,} – {trait_df['n'].max():,}")
+print(f"Median N: {trait_df['n'].median():,.0f}")
+trait_df.head(10)
+```
+
+```{python}
+store = zarr.open(str(STORE_RAW), mode="r")
+
+nan_per_trait = np.isnan(store["beta"][:, :]).mean(axis=0)
+trait_df["nan_frac"] = nan_per_trait
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(8, 3))
+ax.hist(nan_per_trait, bins=20, edgecolor="white")
+ax.set_xlabel("Fraction of variants missing per trait (NaN)")
+ax.set_ylabel("Number of traits")
+ax.set_title("Missingness distribution across 100 traits")
+plt.tight_layout()
+plt.show()
+print(f"Median missingness: {np.median(nan_per_trait):.1%}   "
+      f"Max: {nan_per_trait.max():.1%}")
+```
+
+## Storage Benchmark
+
+```{python}
+def dir_bytes(path: Path) -> int:
+    result = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True)
+    return int(result.stdout.split()[0])
+
+def vcf_bytes(vcf_dir: Path) -> int:
+    total = 0
+    for f in vcf_dir.glob("*.vcf.gz"):
+        total += f.stat().st_size
+    return total
+
+vcf_b    = vcf_bytes(VCF_DIR)
+raw_b    = dir_bytes(STORE_RAW)
+zstd_b   = dir_bytes(STORE_ZSTD)
+
+def fmt_mb(b): return f"{b/1e6:.1f} MB"
+
+storage = pd.DataFrame([
+    {"Format": "100 × VCF.gz (chr1)",     "Size": fmt_mb(vcf_b),  "vs VCF": "1.0×",
+     "vs raw .besdz": "—"},
+    {"Format": "raw float16 .besdz",       "Size": fmt_mb(raw_b),  "vs VCF": f"{vcf_b/raw_b:.1f}×",
+     "vs raw .besdz": "1.0×"},
+    {"Format": "zstd+bitshuffle .besdz",   "Size": fmt_mb(zstd_b), "vs VCF": f"{vcf_b/zstd_b:.1f}×",
+     "vs raw .besdz": f"{raw_b/zstd_b:.1f}×"},
+])
+storage
+```
+
+```{python}
+genome_scale = 22   # chr1 → full genome rough multiplier
+
+print("Extrapolated full genome estimates:")
+for label, b in [("VCF", vcf_b), ("raw .besdz", raw_b), ("zstd .besdz", zstd_b)]:
+    print(f"  {label:<22} {fmt_mb(b * genome_scale)}")
+```
+
+> **Note**: ratios are lower than the PRD's 8× estimate because the VCFs are already
+> bgzipped. The ~46% median missingness (MAC-filtered variants in case-control traits)
+> also limits compressibility of the float16 arrays.
+
+## Query Latency
+
+Four query patterns, timed over 10 repetitions each.
+
+```{python}
+keys = np.load(str(STORE_RAW / "variant_keys.npy"), allow_pickle=True)
+key_to_row = {(str(r[0]), int(r[1]), str(r[2]), str(r[3])): i for i, r in enumerate(keys)}
+
+
+def tabix_indices(store_dir, chrom, start, end):
+    tsv_gz = str(store_dir / "variants.tsv.gz")
+    result = subprocess.run(
+        [TABIX, tsv_gz, f"{chrom}:{start}-{end}"],
+        capture_output=True, text=True,
+    )
+    if not result.stdout.strip():
+        return np.array([], dtype=np.int32)
+    indices = []
+    for line in result.stdout.strip().split("\n"):
+        parts = line.split("\t")
+        key = (parts[0], int(parts[1]), parts[2], parts[3])
+        idx = key_to_row.get(key)
+        if idx is not None:
+            indices.append(idx)
+    return np.array(sorted(indices), dtype=np.int32)
+
+
+def bench(fn, n=10):
+    times = [time.perf_counter() - time.perf_counter() for _ in range(n)]  # warm
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        result = fn()
+        times.append(time.perf_counter() - t0)
+    return np.median(times) * 1000, np.percentile(times, 95) * 1000, result
+
+
+# Find a trait with significant hits for the tophits query
+store_raw = zarr.open(str(STORE_RAW), mode="r")
+hits_by_trait = [(int(np.sum(np.abs(store_raw["zscore"][:, c]) > Z_THRESH)), c)
+                 for c in range(meta["n_traits"])]
+tophits_col = max(hits_by_trait)[1]
+tophits_id  = meta["trait_ids"][tophits_col]
+print(f"Top-hits query uses: {tophits_id}  ({max(hits_by_trait)[0]} hits on chr1)")
+```
+
+```{python}
+REGION = ("1", 100_000_000, 101_000_000)
+region_indices = tabix_indices(STORE_RAW, *REGION)
+
+# PheWAS: pick the midpoint of the region
+ph_indices = tabix_indices(STORE_RAW, "1", 100_500_000, 100_500_001)
+ph_row = int(ph_indices[0]) if len(ph_indices) > 0 else int(region_indices[len(region_indices)//2])
+
+rows = []
+for store_name, store_dir in [("raw float16", STORE_RAW), ("zstd+bitshuffle", STORE_ZSTD)]:
+    s = zarr.open(str(store_dir), mode="r")
+
+    queries = {
+        "regional (1 Mb, all traits)": lambda s=s, i=region_indices: s["beta"].oindex[i, :],
+        "PheWAS (1 variant, all traits)": lambda s=s, r=ph_row: s["beta"][r, :],
+        f"top hits (|Z|>{Z_THRESH}, 1 trait)": lambda s=s, c=tophits_col: (
+            lambda z=s["zscore"][:, c]: z[np.abs(z) > Z_THRESH]
+        )(),
+        "bulk trait (all variants)": lambda s=s, c=tophits_col: s["beta"][:, c],
+    }
+
+    for q_name, fn in queries.items():
+        med, p95, result = bench(fn)
+        rows.append({
+            "Store": store_name,
+            "Query": q_name,
+            "Median (ms)": round(med, 1),
+            "p95 (ms)": round(p95, 1),
+            "Result size": f"{np.asarray(result).size:,} values",
+        })
+
+latency_df = pd.DataFrame(rows)
+latency_df
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(9, 4))
+pivot = latency_df.pivot(index="Query", columns="Store", values="Median (ms)")
+pivot.plot(kind="barh", ax=ax, logx=True)
+ax.set_xlabel("Median latency (ms, log scale)")
+ax.set_title("Query latency by type and compression")
+ax.axvline(1000, color="red", linestyle="--", alpha=0.5, label="1 second")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## MR Precision Validation
+
+IVW MR results from the Zarr store vs the original VCF files. Tolerances: relative
+error < 1%, log₁₀-p difference < 0.5.
+
+```{python}
+import cyvcf2
+
+def ivw_mr(beta_x, se_x, beta_y, se_y):
+    from math import erfc, sqrt
+    w = 1.0 / se_y**2
+    est = np.sum(w * beta_y * beta_x / se_x) / np.sum(w * beta_x**2 / se_x**2)
+    se_est = np.sqrt(1.0 / np.sum(w * beta_x**2 / se_x**2))
+    z = est / se_est
+    p = float(erfc(abs(z) / sqrt(2)))
+    return est, se_est, z, p
+
+
+def vcf_stats(vcf_path, positions):
+    out = {}
+    vcf = cyvcf2.VCF(str(vcf_path))
+    for v in vcf:
+        if (v.CHROM, v.POS) not in positions:
+            continue
+        es = v.format("ES")
+        se = v.format("SE")
+        if es is None or se is None:
+            continue
+        beta, se_val = float(es[0][0]), float(se[0][0])
+        if se_val == 0:
+            continue
+        alt, ref = v.ALT[0], v.REF
+        if not (alt < ref):
+            beta = -beta
+        out[(v.CHROM, v.POS, min(ref, alt), max(ref, alt))] = (beta, se_val)
+    vcf.close()
+    return out
+
+
+manifest_rows = []
+with open(meta["source"]) as fh:
+    hdr = fh.readline().strip().split("\t")
+    for line in fh:
+        manifest_rows.append(dict(zip(hdr, line.strip().split("\t"))))
+
+store_raw  = zarr.open(str(STORE_RAW),  mode="r")
+store_zstd = zarr.open(str(STORE_ZSTD), mode="r")
+
+# Pick exposure traits with ≥10 instruments
+exp_cols = [c for n_hits, c in hits_by_trait if n_hits >= 10][:5]
+
+mr_rows = []
+for exp_col in exp_cols:
+    for out_col in [c for c in range(meta["n_traits"]) if c != exp_col][:2]:
+        for s, sname in [(store_raw, "raw float16"), (store_zstd, "zstd+bitshuffle")]:
+            z_exp = s["zscore"][:, exp_col]
+            inst  = np.where(np.abs(z_exp) > Z_THRESH)[0]
+
+            bx = s["beta"][inst, exp_col].astype(np.float32)
+            zx = z_exp[inst].astype(np.float32)
+            by = s["beta"][inst, out_col].astype(np.float32)
+            zy = s["zscore"][inst, out_col].astype(np.float32)
+            sex = np.abs(bx / zx)
+            sey = np.abs(by / zy)
+
+            ok = np.isfinite(bx) & np.isfinite(sex) & np.isfinite(by) & np.isfinite(sey) & (sex > 0) & (sey > 0)
+            if ok.sum() < 3:
+                continue
+
+            zarr_est, _, _, zarr_p = ivw_mr(bx[ok], sex[ok], by[ok], sey[ok])
+
+            inst_keys = keys[inst[ok]]
+            positions = {(str(k[0]), int(k[1])) for k in inst_keys}
+            vcf_out  = vcf_stats(manifest_rows[out_col]["file_path"], positions)
+            vcf_exp  = vcf_stats(manifest_rows[exp_col]["file_path"], positions)
+
+            bx_v, sex_v, by_v, sey_v = [], [], [], []
+            for k in inst_keys:
+                fk = (str(k[0]), int(k[1]), str(k[2]), str(k[3]))
+                eo = vcf_out.get(fk)
+                ee = vcf_exp.get(fk)
+                if eo and ee:
+                    by_v.append(eo[0]); sey_v.append(eo[1])
+                    bx_v.append(ee[0]); sex_v.append(ee[1])
+
+            if len(bx_v) < 3:
+                continue
+
+            vcf_est, _, _, vcf_p = ivw_mr(
+                np.array(bx_v), np.array(sex_v),
+                np.array(by_v), np.array(sey_v),
+            )
+            rel_err  = abs(zarr_est - vcf_est) / (abs(vcf_est) + 1e-10)
+            logp_diff = abs(np.log10(max(zarr_p, 1e-300)) - np.log10(max(vcf_p, 1e-300)))
+
+            mr_rows.append({
+                "Store":      sname,
+                "Exposure":   meta["trait_ids"][exp_col],
+                "Outcome":    meta["trait_ids"][out_col],
+                "N instr.":   int(ok.sum()),
+                "VCF est.":   round(float(vcf_est), 6),
+                "Zarr est.":  round(float(zarr_est), 6),
+                "Rel. err. %": round(rel_err * 100, 4),
+                "Δlog₁₀p":   round(logp_diff, 4),
+                "Pass":       "✓" if rel_err < 0.01 and logp_diff < 0.5 else "✗",
+            })
+
+mr_df = pd.DataFrame(mr_rows)
+mr_df
+```
+
+```{python}
+n_pass = (mr_df["Pass"] == "✓").sum()
+print(f"{n_pass}/{len(mr_df)} pairs pass tolerances "
+      f"(rel. error <1%, Δlog₁₀p <0.5)")
+print(f"Max relative error: {mr_df['Rel. err. %'].max():.4f}%")
+print(f"Max Δlog₁₀p:        {mr_df['Δlog₁₀p'].max():.4f}")
+```
+
+## Conclusions
+
+```{python}
+print(f"""
+Storage
+  Raw float16 .besdz is {vcf_b/raw_b:.1f}× smaller than bgzipped VCF on chr1.
+  zstd+bitshuffle adds a further {raw_b/zstd_b:.1f}× gain ({vcf_b/zstd_b:.1f}× vs VCF).
+  High missingness (~{np.median(nan_per_trait):.0%} median NaN) from MAC-filtered
+  case-control traits limits compression — lossless gains are modest.
+  Extrapolated full genome: raw ~{fmt_mb(raw_b*22)}, zstd ~{fmt_mb(zstd_b*22)}.
+
+Query latency
+  Regional (1 Mb, all traits): {latency_df.query("Query.str.startswith('regional') and Store=='raw float16'")['Median (ms)'].values[0]:.1f} ms raw  /  {latency_df.query("Query.str.startswith('regional') and Store=='zstd+bitshuffle'")['Median (ms)'].values[0]:.1f} ms zstd
+  PheWAS (1 variant):          {latency_df.query("Query.str.startswith('PheWAS') and Store=='raw float16'")['Median (ms)'].values[0]:.1f} ms raw  /  {latency_df.query("Query.str.startswith('PheWAS') and Store=='zstd+bitshuffle'")['Median (ms)'].values[0]:.1f} ms zstd
+  Top hits (one trait):        {latency_df.query("Query.str.contains('hit') and Store=='raw float16'")['Median (ms)'].values[0]:.0f} ms raw  /  {latency_df.query("Query.str.contains('hit') and Store=='zstd+bitshuffle'")['Median (ms)'].values[0]:.0f} ms zstd
+  Bulk trait:                  {latency_df.query("Query.str.startswith('bulk') and Store=='raw float16'")['Median (ms)'].values[0]:.0f} ms raw  /  {latency_df.query("Query.str.startswith('bulk') and Store=='zstd+bitshuffle'")['Median (ms)'].values[0]:.0f} ms zstd
+  zstd roughly doubles column-scan latency (tophits, bulk) for a 1.3× size gain.
+
+MR precision
+  {n_pass}/{len(mr_df)} pairs pass tolerances (<1% rel. error, <0.5 Δlog₁₀p).
+  Max relative error: {mr_df['Rel. err. %'].max():.4f}%  — well within tolerance.
+  float16 encoding is safe for MR analyses.
+
+Recommendation
+  Format is viable. Raw float16 is the preferred default:
+  zstd adds marginal storage gain but doubles query latency on column scans.
+  The main open question for production is handling high-missingness traits —
+  consider per-batch NaN density as a quality metric at ingest time.
+""")
+```

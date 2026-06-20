@@ -165,6 +165,40 @@ Independent significant trans peaks are identified by LD clumping with plink2 (m
 
 BESD files imported via the legacy path arrive pre-filtered and are stored verbatim — the Lean Index applies no additional filters to them.
 
+## Dense Batch Format — Design Decisions
+
+These decisions apply to the dense Zarr-based batch format (`.besdz` stores) and are format-agnostic in the sense that they would carry over to any successor format.
+
+### Variant Identity
+
+Same ALID convention as the Lean Index: canonical key is `chr:pos:A1:A2` where **A1 is alphabetically first**. The sign of beta and z-score must match — if the source effect allele is not alphabetically first, alleles are swapped and the sign is negated at build time. This is identical to the besdq sparse convention and to pleioDB.
+
+### Variant Table
+
+Built as the **union** of all variants across all traits in a batch. Variants absent from a given trait are encoded as float16 NaN in the stats arrays (no separate missingness mask). This accommodates traits with MAC filters or rare-disease exclusions, which can have substantial missingness relative to the batch-wide variant list.
+
+EAF is averaged across all traits that tested each variant, computed in the same pass as the union variant collection. INFO score is taken from the reference file (the trait with the most variants).
+
+### Stats Arrays
+
+Two separate Zarr arrays per store: `beta` and `zscore`, both shape `(N_variants, N_traits)`, dtype float16. SE is not stored — reconstructed at query time as `beta / zscore`. P-value is derived from Z. Separate arrays allow queries that only need Z (PheWAS, top-hits) to skip loading beta.
+
+### Effect Scale
+
+Stored in **original study units** — whatever units appear in the source files. No SD-unit normalisation (no `trait_var` division). SE reconstruction `SE = beta / Z` stays in original units. This keeps the prototype simple and makes round-trip comparison to source VCFs direct.
+
+### Sample Size N
+
+Scalar per trait, extracted from VCF header at build time. Not stored per-variant.
+
+### Prototype Scope
+
+The prototype is implemented as **standalone scripts or a notebook**, with no integration into the `besdq` package. Its sole purpose is to validate storage size, query latency, and MR precision. Integration into the besdq CLI and package happens only if the benchmark confirms the format is viable. The pleioDB project serves a similar purpose to the dense batch format; its conventions (ALID, effect scale handling) are the relevant prior art to port, and it may become redundant once the dense format is production-ready.
+
+### Store Suffix
+
+`.besdz` (provisional). The `z` signals Zarr. The `besd` prefix may change if the project renames away from the BESD lineage.
+
 ## Build Modes (Lean Index)
 
 | Dataset type | Storage mode | SE source | sd_y source |
