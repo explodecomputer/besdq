@@ -199,6 +199,26 @@ The prototype is implemented as **standalone scripts or a notebook**, with no in
 
 `.besdz` (provisional). The `z` signals Zarr. The `besd` prefix may change if the project renames away from the BESD lineage.
 
+### Significance Index (Dense Format)
+
+A query-acceleration structure stored **in-place inside a `.besdz` store**, alongside `beta` and `zscore`. Not to be confused with the Lean Index [Significance Mask](#significance-mask), which is an import-time filter that determines what gets stored; the Significance Index is a pre-computed lookup table over already-stored data.
+
+Three p-value thresholds: 5×10⁻⁸ (genome-wide significant), 5×10⁻⁶, 5×10⁻⁴.
+
+**Storage layout** (6 Zarr arrays total, one pair per threshold):
+- `sig_5e8` — flat uint32 array of variant row indices, sorted per trait and concatenated across all N_traits traits
+- `sig_5e8_offsets` — int64 array of shape `(N_traits + 1,)`; trait t's hits are `sig_5e8[offsets[t]:offsets[t+1]]`
+- Same pattern for `sig_5e6` and `sig_5e4`
+
+P-values are derived from stored Z-scores: `p = 2 × (1 − Φ(|Z|))`. Variants with NaN Z-score (untested) are excluded from all indexes.
+
+**Tophits query** with index (vs naive full-column scan):
+1. Load `sig_{key}_offsets[t:t+2]` — two int64 values
+2. Slice `sig_{key}[start:end]` — the hit row indices for trait t
+3. Fancy-index `beta` and `zscore` at those rows — only the chunks containing hits are read
+
+The index is built by a standalone script (`dense_11_build_sig_index.py`) and can be updated independently of the stats arrays.
+
 ## Build Modes (Lean Index)
 
 | Dataset type | Storage mode | SE source | sd_y source |

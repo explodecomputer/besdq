@@ -1,0 +1,283 @@
+---
+title: "Dense Store: Significance Index Benchmark"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+---
+
+```{python}
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import zarr
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+STORE = "../data/ukb-chr1.besdz"
+THRESHOLDS = [5e-8, 5e-6, 5e-4]
+KEYS = ["5e8", "5e6", "5e4"]
+Z_CUTOFFS = [5.4507, 4.8916, 3.7190]
+N_BENCH_TRAITS = 30
+rng = np.random.default_rng(42)
+```
+
+## Overview
+
+The significance index is a query-acceleration structure stored in-place inside `ukb-chr1.besdz`. For each of three p-value thresholds (5×10⁻⁸, 5×10⁻⁶, 5×10⁻⁴), it stores:
+
+- `sig_{key}` — flat **uint32** array of variant row indices, sorted per trait and concatenated across all 100 traits
+- `sig_{key}_offsets` — **int64** array of shape (101,); trait t's hits are `sig_{key}[offsets[t]:offsets[t+1]]`
+
+Six arrays total, built by `scripts/dense_11_build_sig_index.py` in a single pass over the zscore array.
+
+## Storage Footprint
+
+```{python}
+store_dir = Path(STORE)
+store = zarr.open(str(store_dir), mode="r")
+
+meta = json.load(open(store_dir / "metadata.json"))
+sig_meta = meta["sig_index"]
+
+# Measure size of each component
+def dir_mb(path, pattern="*"):
+    return sum(f.stat().st_size for f in Path(path).rglob(pattern) if f.is_file()) / 1e6
+
+total_mb = dir_mb(store_dir)
+
+# Sig index files
+sig_files_mb = sum(
+    f.stat().st_size
+    for key in KEYS
+    for name in [f"sig_{key}", f"sig_{key}_offsets"]
+    for f in (store_dir / name).rglob("*") if f.is_file()
+) / 1e6
+
+baseline_mb = total_mb - sig_files_mb
+
+rows = [
+    {"Component": "Baseline store (beta + zscore + variant table)", "Size (MB)": round(baseline_mb, 1)},
+    {"Component": "Significance indexes (all 3 thresholds)", "Size (MB)": round(sig_files_mb, 2)},
+    {"Component": "Total store", "Size (MB)": round(total_mb, 1)},
+]
+df_size = pd.DataFrame(rows)
+df_size.style.hide(axis="index")
+```
+
+```{python}
+# Bar chart
+fig, ax = plt.subplots(figsize=(7, 3.5))
+labels = ["Baseline store\n(β/Z + variant table)", "Sig indexes\n(3 thresholds)", "Total"]
+sizes = [round(baseline_mb, 1), round(sig_files_mb, 2), round(total_mb, 1)]
+colors = ["#4C72B0", "#C44E52", "#8172B2"]
+bars = ax.barh(labels, sizes, color=colors)
+for bar, v in zip(bars, sizes):
+    ax.text(v + 1, bar.get_y() + bar.get_height() / 2, f"{v:.0f} MB",
+            va="center", fontsize=10)
+ax.set_xlabel("Size (MB)")
+ax.set_title("Store footprint breakdown — ukb-chr1.besdz (100 traits × chr1)")
+ax.set_xlim(0, max(sizes) * 1.15)
+plt.tight_layout()
+plt.savefig("sig_footprint.png", dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Overhead: {sig_files_mb:.1f} MB / {baseline_mb:.1f} MB = {sig_files_mb/baseline_mb*100:.1f}%")
+```
+
+## Hit Count Distribution
+
+```{python}
+hit_rows = []
+for thresh, key, zcut in zip(THRESHOLDS, KEYS, Z_CUTOFFS):
+    offsets = store[f"sig_{key}_offsets"][:]
+    n_hits_per_trait = np.diff(offsets)
+    hit_rows.append({
+        "Threshold": f"p < {thresh:.0e}",
+        "Total hits": int(n_hits_per_trait.sum()),
+        "Mean / trait": f"{n_hits_per_trait.mean():.0f}",
+        "Median / trait": f"{np.median(n_hits_per_trait):.0f}",
+        "Min / trait": int(n_hits_per_trait.min()),
+        "Max / trait": int(n_hits_per_trait.max()),
+    })
+
+df_hits = pd.DataFrame(hit_rows)
+df_hits.style.hide(axis="index")
+```
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.5), sharey=False)
+for ax, thresh, key in zip(axes, THRESHOLDS, KEYS):
+    offsets = store[f"sig_{key}_offsets"][:]
+    n_hits = np.diff(offsets)
+    ax.hist(n_hits, bins=20, color="#4C72B0", edgecolor="white")
+    ax.set_title(f"p < {thresh:.0e}")
+    ax.set_xlabel("Hits per trait")
+    ax.set_ylabel("# traits")
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+
+plt.suptitle("Distribution of significant hit counts per trait (chr1, 100 traits)", y=1.02)
+plt.tight_layout()
+plt.savefig("sig_hit_dist.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+## Query Latency: Naive vs Indexed
+
+**Naive** tophits: load the full zscore column (~1.5 MB read), apply threshold in-memory, fancy-index beta for hit rows.
+
+**Indexed** tophits: load the pre-built hit indices from the sig index (a small slice), then directly fancy-index both zscore and beta for hit rows.
+
+Both approaches return the same result. The difference is whether variant significance needs to be computed at query time.
+
+```{python}
+def naive_tophits(store, trait_idx, zcut):
+    col_z = store["zscore"][:, trait_idx].astype(np.float32)
+    hits = np.where(np.abs(col_z) > zcut)[0]
+    betas = store["beta"].oindex[hits, trait_idx]
+    return hits, col_z[hits], betas
+
+def indexed_tophits(store, trait_idx, key):
+    off = store[f"sig_{key}_offsets"][trait_idx : trait_idx + 2]
+    hits = store[f"sig_{key}"][int(off[0]) : int(off[1])]
+    z_vals = store["zscore"].oindex[hits, trait_idx]
+    betas = store["beta"].oindex[hits, trait_idx]
+    return hits, z_vals, betas
+```
+
+```{python}
+trait_indices = rng.choice(meta["n_traits"], size=N_BENCH_TRAITS, replace=False)
+
+latency_records = []
+
+for thresh, key, zcut in zip(THRESHOLDS, KEYS, Z_CUTOFFS):
+    for t in trait_indices:
+        # naive
+        t0 = time.perf_counter()
+        hits_n, _, _ = naive_tophits(store, int(t), zcut)
+        ms_naive = (time.perf_counter() - t0) * 1000
+
+        # indexed
+        t0 = time.perf_counter()
+        hits_i, _, _ = indexed_tophits(store, int(t), key)
+        ms_indexed = (time.perf_counter() - t0) * 1000
+
+        assert len(hits_n) == len(hits_i), f"Hit count mismatch at trait {t} threshold {thresh}"
+
+        latency_records.append({
+            "threshold": f"p < {thresh:.0e}",
+            "trait": int(t),
+            "n_hits": len(hits_n),
+            "naive_ms": ms_naive,
+            "indexed_ms": ms_indexed,
+            "speedup": ms_naive / max(ms_indexed, 0.01),
+        })
+
+df_lat = pd.DataFrame(latency_records)
+```
+
+```{python}
+summary = (
+    df_lat.groupby("threshold")
+    .agg(
+        naive_median=("naive_ms", "median"),
+        indexed_median=("indexed_ms", "median"),
+        speedup_median=("speedup", "median"),
+        n_hits_median=("n_hits", "median"),
+    )
+    .reset_index()
+    .rename(columns={
+        "threshold": "Threshold",
+        "naive_median": "Naive (ms)",
+        "indexed_median": "Indexed (ms)",
+        "speedup_median": "Speedup",
+        "n_hits_median": "Median hits/trait",
+    })
+)
+summary["Naive (ms)"] = summary["Naive (ms)"].round(1)
+summary["Indexed (ms)"] = summary["Indexed (ms)"].round(1)
+summary["Speedup"] = summary["Speedup"].round(1)
+summary["Median hits/trait"] = summary["Median hits/trait"].astype(int)
+summary.style.hide(axis="index")
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+# Latency comparison bar chart
+thresholds_ordered = [f"p < {t:.0e}" for t in THRESHOLDS]
+naive_meds = [df_lat[df_lat.threshold == t]["naive_ms"].median() for t in thresholds_ordered]
+indexed_meds = [df_lat[df_lat.threshold == t]["indexed_ms"].median() for t in thresholds_ordered]
+
+x = np.arange(len(thresholds_ordered))
+w = 0.35
+ax = axes[0]
+ax.bar(x - w/2, naive_meds, w, label="Naive", color="#C44E52")
+ax.bar(x + w/2, indexed_meds, w, label="Indexed", color="#4C72B0")
+ax.set_xticks(x)
+ax.set_xticklabels(thresholds_ordered)
+ax.set_ylabel("Median latency (ms)")
+ax.set_title("Tophits query latency by threshold")
+ax.legend()
+for i, (n, idx) in enumerate(zip(naive_meds, indexed_meds)):
+    ax.text(i - w/2, n + 0.5, f"{n:.0f}", ha="center", fontsize=8, color="#C44E52")
+    ax.text(i + w/2, idx + 0.5, f"{idx:.0f}", ha="center", fontsize=8, color="#4C72B0")
+
+# Speedup bar chart
+speedups = [df_lat[df_lat.threshold == t]["speedup"].median() for t in thresholds_ordered]
+ax2 = axes[1]
+ax2.bar(thresholds_ordered, speedups, color="#55A868")
+ax2.axhline(1, color="gray", linestyle="--", linewidth=0.8)
+ax2.set_ylabel("Median speedup (naive / indexed)")
+ax2.set_title("Query speedup from significance index")
+for i, s in enumerate(speedups):
+    ax2.text(i, s + 0.1, f"{s:.1f}×", ha="center", fontsize=10, fontweight="bold")
+
+plt.tight_layout()
+plt.savefig("sig_latency.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+```{python}
+# Scatter: speedup vs hit count
+fig, ax = plt.subplots(figsize=(7, 4))
+colors_map = {f"p < {t:.0e}": c for t, c in zip(THRESHOLDS, ["#C44E52", "#DD8452", "#4C72B0"])}
+for thresh in thresholds_ordered:
+    sub = df_lat[df_lat.threshold == thresh]
+    ax.scatter(sub["n_hits"], sub["speedup"], label=thresh, alpha=0.6,
+               color=colors_map[thresh], s=40)
+ax.axhline(1, color="gray", linestyle="--", linewidth=0.8)
+ax.set_xlabel("Number of significant hits")
+ax.set_ylabel("Speedup (naive / indexed)")
+ax.set_title("Speedup vs hit density")
+ax.legend()
+plt.tight_layout()
+plt.savefig("sig_speedup_scatter.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+## Conclusions
+
+```{python}
+best_speedup = df_lat.groupby("threshold")["speedup"].median().max()
+worst_speedup = df_lat.groupby("threshold")["speedup"].median().min()
+index_overhead_pct = sig_files_mb / baseline_mb * 100
+
+print(f"Storage overhead:   +{sig_files_mb:.1f} MB on {baseline_mb:.0f} MB baseline = {index_overhead_pct:.1f}%")
+print(f"Speedup range:      {worst_speedup:.1f}× – {best_speedup:.1f}× across thresholds")
+print()
+print("Per-threshold summary:")
+for _, row in summary.iterrows():
+    print(f"  {row['Threshold']}: naive={row['Naive (ms)']:.1f}ms  "
+          f"indexed={row['Indexed (ms)']:.1f}ms  speedup={row['Speedup']:.1f}×  "
+          f"hits={row['Median hits/trait']}")
+```
+
+**Footprint**: the significance index adds `{python} f"{sig_files_mb:.2f}"` MB to the `{python} f"{baseline_mb:.0f}"` MB store — well under 0.1% overhead for three thresholds. Bitshuffle+zstd compresses the sorted uint32 hit lists very effectively. Cost is fixed regardless of query volume.
+
+**Query latency**: the indexed path is fastest at the sparsest threshold (p < 5×10⁻⁸) because the pre-built hit list is tiny and skips loading the full zscore column (~1.5 MB). At p < 5×10⁻⁴, the speedup is smaller — more chunks must be touched regardless of whether the index is used. The speedup is highest when many traits have zero hits (the indexed path returns immediately; the naive path still scans everything).
+
+**Recommendation**: significance indexes are worth including in the production format. The footprint overhead is negligible, and the tophits query — the dominant use case for MR instrument extraction — sees the largest speedup at the threshold (p < 5×10⁻⁸) used most often.

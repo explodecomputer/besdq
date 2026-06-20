@@ -1,0 +1,577 @@
+---
+title: "LD Eigenvector Compression — Benchmark Report"
+subtitle: "chr1 × 100 UKB traits · LDetect EUR blocks · 1KG EUR reference"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+jupyter: python3
+---
+
+## Overview
+
+This report benchmarks LD eigenvector compression of the `.besdz` dense Zarr store
+against the raw float16 and zstd+bitshuffle baselines.
+
+**Compression approach**: for each LDetect EUR block, eigendecompose the LD correlation
+matrix R (computed from 1000 Genomes EUR, MAF ≥ 0.01), then store projected coefficients
+**c** = Vᵀ**β** truncated to retain K eigenvectors. Three variance-explained thresholds
+are compared: 95%, 99%, 99.9%.
+
+Three questions:
+
+1. **Storage** — how much smaller is LD compression vs raw float16?
+2. **Query latency** — what is the reconstruction overhead vs direct zarr access?
+3. **MR precision** — do IVW estimates from LD-reconstructed data pass the 1% / 0.5 log10p tolerances?
+
+```{python}
+import json
+import subprocess
+import time
+from math import erfc, sqrt
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import zarr
+
+RAW_STORE   = Path("../data/ukb-chr1.besdz")
+ZSTD_STORE  = Path("../data/ukb-chr1-zstd.besdz")
+LD_STORES   = {
+    "ld95":   Path("../data/ukb-chr1-ld95.besdz"),
+    "ld99":   Path("../data/ukb-chr1-ld99.besdz"),
+    "ld99p9": Path("../data/ukb-chr1-ld99p9.besdz"),
+}
+EIGVEC_DIR  = Path("../data/ld_eigenvectors")
+TABIX       = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
+Z_THRESH    = 5.45   # ~p < 5e-8
+
+meta = json.loads((RAW_STORE / "metadata.json").read_text())
+print(f"Variants: {meta['n_variants']:,}   Traits: {meta['n_traits']}")
+```
+
+## LD Blocks Summary
+
+```{python}
+block_manifest = json.loads((EIGVEC_DIR / "block_manifest.json").read_text())
+
+n_blocks      = len(block_manifest)
+k_vals        = [b["k_stored"] for b in block_manifest if b["k_stored"] > 0]
+m_vals        = [b["n_intersection_variants"] for b in block_manifest if b["n_intersection_variants"] > 0]
+pt_total      = sum(b["n_passthrough_variants"] for b in block_manifest)
+comp_total    = sum(b["n_intersection_variants"] for b in block_manifest)
+
+summary = pd.DataFrame({
+    "Metric": [
+        "LDetect chr1 blocks",
+        "Blocks with LD coverage",
+        "Compressed variants (1KG ∩ UKB)",
+        "Passthrough variants (UKB only)",
+        "Median block intersection size (m)",
+        "Median K stored (99.9% threshold)",
+        "Median K/m ratio",
+    ],
+    "Value": [
+        f"{n_blocks}",
+        f"{len(k_vals)}",
+        f"{comp_total:,}",
+        f"{pt_total:,}",
+        f"{int(np.median(m_vals)):,}",
+        f"{int(np.median(k_vals)):,}",
+        f"{np.median(k_vals) / np.median(m_vals):.2f}",
+    ],
+})
+summary
+```
+
+```{python}
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+axes[0].hist(m_vals, bins=30, edgecolor="white", color="steelblue")
+axes[0].set_xlabel("Intersection variants per block (m)")
+axes[0].set_ylabel("Count")
+axes[0].set_title("Block intersection sizes")
+
+axes[1].hist(k_vals, bins=30, edgecolor="white", color="darkorange")
+axes[1].set_xlabel("K stored (99.9% threshold)")
+axes[1].set_title("Eigenvectors stored per block")
+
+plt.tight_layout()
+plt.savefig("ld_block_summary.png", dpi=120)
+plt.show()
+print(f"K capped at ~503 (1KG EUR sample size)")
+```
+
+## Storage Sizes
+
+```{python}
+def store_size_mb(path):
+    r = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True)
+    return int(r.stdout.split()[0]) / 1e6
+
+vcf_size = sum(
+    p.stat().st_size for p in Path("../data/vcf-ukb").glob("*.vcf.gz")
+) / 1e6
+
+all_stores = {
+    "bgzipped VCF (source)": None,
+    "raw float16":           RAW_STORE,
+    "zstd+bitshuffle":       ZSTD_STORE,
+    "LD 95%":                LD_STORES["ld95"],
+    "LD 99%":                LD_STORES["ld99"],
+    "LD 99.9%":              LD_STORES["ld99p9"],
+}
+
+sizes = {}
+for name, path in all_stores.items():
+    sizes[name] = vcf_size if path is None else store_size_mb(path)
+
+raw_mb = sizes["raw float16"]
+storage_df = pd.DataFrame([
+    {
+        "Format":          name,
+        "Size (MB)":       f"{mb:.0f}",
+        "vs VCF":          f"{vcf_size / mb:.1f}×",
+        "vs raw float16":  "—" if name == "raw float16" else f"{raw_mb / mb:.1f}×",
+    }
+    for name, mb in sizes.items()
+])
+storage_df
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(9, 4))
+names  = list(sizes.keys())
+values = [sizes[n] for n in names]
+colors = ["#aaaaaa", "#4c72b0", "#4c72b0", "#dd8452", "#dd8452", "#dd8452"]
+bars   = ax.barh(names[::-1], values[::-1], color=colors[::-1])
+ax.set_xlabel("Size (MB)")
+ax.set_title("Store sizes — chr1 × 100 traits")
+for bar, val in zip(bars, values[::-1]):
+    ax.text(bar.get_width() + 2, bar.get_y() + bar.get_height()/2,
+            f"{val:.0f} MB", va="center", fontsize=9)
+plt.tight_layout()
+plt.savefig("ld_storage.png", dpi=120)
+plt.show()
+```
+
+## Reconstruction Accuracy
+
+How well does LD eigenvector projection reconstruct the original betas?
+
+```{python}
+raw_zarr    = zarr.open(str(RAW_STORE), mode="r")
+block_idx   = json.loads((LD_STORES["ld99p9"] / "block_index.json").read_text())
+ev          = np.load(str(EIGVEC_DIR / "eigenvectors.npz"))
+
+# Load full source beta (float32)
+beta_orig   = raw_zarr["beta"][:].astype(np.float32)
+zscore_orig = raw_zarr["zscore"][:].astype(np.float32)
+sig_mask    = np.abs(zscore_orig) > Z_THRESH
+print(f"Genome-wide significant positions (|Z|>{Z_THRESH}): {sig_mask.sum():,}")
+```
+
+```{python}
+def reconstruct_full(ld_path, n_variants=762488, n_traits=100, array="beta"):
+    zs  = zarr.open(str(ld_path), mode="r")
+    bi  = json.loads((ld_path / "block_index.json").read_text())
+    evp = np.load(str(EIGVEC_DIR / "eigenvectors.npz"))
+    out = np.full((n_variants, n_traits), np.nan, dtype=np.float32)
+    for b in bi:
+        K = b["K"]
+        if K == 0:
+            continue
+        V = evp[f"b{b['block_id']}"][:, :K]
+        C = zs[f"coefficients_{array}"][b["coeff_row_start"]:b["coeff_row_end"], :]
+        rows = np.array(b["zarr_row_indices"], dtype=np.intp)
+        out[rows, :] = V @ C
+    if "passthrough_row_indices" in zs:
+        pt = zs["passthrough_row_indices"][:]
+        out[pt, :] = zs[f"passthrough_{array}"][:].astype(np.float32)
+    # Restore NaN mask
+    nan_rows, nan_cols = np.where(zs["nan_mask"][:])
+    out[nan_rows, nan_cols] = np.nan
+    return out
+
+rows = []
+for label, ld_path in LD_STORES.items():
+    beta_hat = reconstruct_full(ld_path)
+    valid    = ~np.isnan(beta_orig)
+    sig_v    = sig_mask & valid
+
+    rmse_all = np.sqrt(np.mean((beta_hat[valid] - beta_orig[valid])**2))
+    rmse_sig = np.sqrt(np.mean((beta_hat[sig_v] - beta_orig[sig_v])**2)) if sig_v.sum() else np.nan
+    rel_sig  = np.abs(beta_hat[sig_v] - beta_orig[sig_v]) / (np.abs(beta_orig[sig_v]) + 1e-10)
+
+    rows.append({
+        "Store":              label,
+        "RMSE (all tested)":  f"{rmse_all:.5f}",
+        "RMSE (|Z|>5.45)":    f"{rmse_sig:.5f}",
+        "Median rel err (sig, %)": f"{np.median(rel_sig)*100:.1f}",
+        "P99 rel err (sig, %)":    f"{np.percentile(rel_sig, 99)*100:.1f}",
+    })
+
+pd.DataFrame(rows)
+```
+
+> Relative errors are large for near-null betas (most of the data).
+> The relevant question for MR is whether IVW averaging over many instruments
+> cancels individual-variant errors — tested in the next section.
+
+## Query Latency
+
+```{python}
+def bench(fn, n=10):
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return np.median(times) * 1000, np.percentile(times, 95) * 1000
+
+def tabix_indices(store_dir, chrom, start, end, key_to_row):
+    r = subprocess.run([TABIX, f"{store_dir}/variants.tsv.gz", f"{chrom}:{start}-{end}"],
+                       capture_output=True, text=True)
+    if not r.stdout.strip():
+        return np.array([], dtype=np.int32)
+    out = []
+    for line in r.stdout.strip().split("\n"):
+        p = line.split("\t")
+        idx = key_to_row.get((p[0], int(p[1]), p[2], p[3]))
+        if idx is not None:
+            out.append(idx)
+    return np.array(sorted(out), dtype=np.int32)
+
+keys_arr    = np.load(str(RAW_STORE / "variant_keys.npy"), allow_pickle=True)
+key_to_row  = {(str(r[0]), int(r[1]), str(r[2]), str(r[3])): i for i, r in enumerate(keys_arr)}
+
+REGION      = ("1", 100_000_000, 101_000_000)
+PH_POS      = ("1", 100_500_000)
+region_idx  = tabix_indices(str(RAW_STORE), *REGION, key_to_row)
+ph_indices  = tabix_indices(str(RAW_STORE), PH_POS[0], int(PH_POS[1]), int(PH_POS[1])+1, key_to_row)
+ph_row      = int(ph_indices[0]) if len(ph_indices) else 0
+
+# Trait with most hits for tophits/bulk
+tophits_col = int(np.argmax([np.sum(np.abs(zscore_orig[:, c]) > Z_THRESH) for c in range(100)]))
+print(f"Regional variants: {len(region_idx)}, PheWAS row: {ph_row}, tophits trait col: {tophits_col}")
+```
+
+```{python}
+latency_rows = []
+
+# Raw and zstd stores
+for store_name, store_path in [("raw_float16", RAW_STORE), ("zstd_bitshuffle", ZSTD_STORE)]:
+    zs = zarr.open(str(store_path), mode="r")
+    queries = {
+        "regional": lambda s=zs, idx=region_idx: s["beta"].oindex[idx, :],
+        "phewas":   lambda s=zs, r=ph_row:       s["beta"][r, :],
+        "tophits":  lambda s=zs, c=tophits_col: (
+            lambda z=s["zscore"][:, c]: s["beta"][np.where(np.abs(z) > Z_THRESH)[0], c])(),
+        "bulk":     lambda s=zs, c=tophits_col:   s["beta"][:, c],
+    }
+    for q_name, fn in queries.items():
+        med, p95 = bench(fn)
+        latency_rows.append({"store": store_name, "query": q_name,
+                              "median_ms": med, "p95_ms": p95})
+
+# LD stores (bulk column reconstruction)
+def ld_bulk(ld_path, col, n=762488):
+    zs  = zarr.open(str(ld_path), mode="r")
+    bi  = json.loads((ld_path / "block_index.json").read_text())
+    evp = np.load(str(EIGVEC_DIR / "eigenvectors.npz"))
+    out = np.full(n, np.nan, dtype=np.float32)
+    for b in bi:
+        K = b["K"]
+        if K == 0:
+            continue
+        rows = np.array(b["zarr_row_indices"], dtype=np.intp)
+        V = evp[f"b{b['block_id']}"][:, :K]
+        C = zs["coefficients_beta"][b["coeff_row_start"]:b["coeff_row_end"], col]
+        out[rows] = V @ C
+    return out
+
+def ld_regional(ld_path, region_rows):
+    zs  = zarr.open(str(ld_path), mode="r")
+    bi  = json.loads((ld_path / "block_index.json").read_text())
+    evp = np.load(str(EIGVEC_DIR / "eigenvectors.npz"))
+    region_set = set(region_rows.tolist())
+    result = {}
+    for b in bi:
+        K = b["K"]
+        overlap = [r for r in b["zarr_row_indices"] if r in region_set]
+        if K == 0 or not overlap:
+            continue
+        local_idx = [b["zarr_row_indices"].index(r) for r in overlap]
+        V = evp[f"b{b['block_id']}"][np.array(local_idx), :K]
+        C = zs["coefficients_beta"][b["coeff_row_start"]:b["coeff_row_end"], :]
+        for i, r in enumerate(overlap):
+            result[r] = V[i] @ C
+    return result
+
+def ld_phewas(ld_path, row):
+    zs  = zarr.open(str(ld_path), mode="r")
+    bi  = json.loads((ld_path / "block_index.json").read_text())
+    evp = np.load(str(EIGVEC_DIR / "eigenvectors.npz"))
+    for b in bi:
+        if row in b["zarr_row_indices"]:
+            K = b["K"]
+            if K == 0:
+                return np.full(100, np.nan)
+            local_i = b["zarr_row_indices"].index(row)
+            V = evp[f"b{b['block_id']}"][local_i, :K]
+            C = zs["coefficients_beta"][b["coeff_row_start"]:b["coeff_row_end"], :]
+            return V @ C
+    return np.full(100, np.nan)
+
+for ld_name, ld_path in LD_STORES.items():
+    queries = {
+        "regional": lambda p=ld_path: ld_regional(p, region_idx),
+        "phewas":   lambda p=ld_path: ld_phewas(p, ph_row),
+        "tophits":  lambda p=ld_path, c=tophits_col: (
+            lambda b=ld_bulk(p, c): b[np.isfinite(b) & (np.abs(b) > 0)])(),
+        "bulk":     lambda p=ld_path, c=tophits_col: ld_bulk(p, c),
+    }
+    for q_name, fn in queries.items():
+        med, p95 = bench(fn)
+        latency_rows.append({"store": ld_name, "query": q_name,
+                              "median_ms": med, "p95_ms": p95})
+
+latency_df = pd.DataFrame(latency_rows)
+latency_df["median_ms"] = latency_df["median_ms"].round(1)
+latency_df["p95_ms"]    = latency_df["p95_ms"].round(1)
+latency_df.pivot(index="store", columns="query", values="median_ms")
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(10, 5))
+stores = ["raw_float16", "zstd_bitshuffle", "ld95", "ld99", "ld99p9"]
+queries = ["regional", "phewas", "tophits", "bulk"]
+x = np.arange(len(queries))
+width = 0.15
+colors = ["#4c72b0", "#55a868", "#dd8452", "#c44e52", "#8172b2"]
+
+for i, store in enumerate(stores):
+    vals = [latency_df[(latency_df.store == store) & (latency_df.query == q)]["median_ms"].values
+            for q in queries]
+    vals = [v[0] if len(v) else 0 for v in vals]
+    ax.bar(x + i * width, vals, width, label=store, color=colors[i], alpha=0.85)
+
+ax.set_yscale("log")
+ax.set_xticks(x + 2 * width)
+ax.set_xticklabels(queries)
+ax.set_ylabel("Median latency (ms, log scale)")
+ax.set_title("Query latency — raw vs zstd vs LD-compressed")
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig("ld_latency.png", dpi=120)
+plt.show()
+```
+
+## MR Precision
+
+IVW MR estimates from LD-reconstructed data vs raw float16 zarr (ground truth).
+Tolerances: relative error < 1%, Δlog10p < 0.5.
+
+```{python}
+def norm_cdf(x):
+    return 0.5 * erfc(-x / sqrt(2))
+
+def ivw_mr(bx, sx, by, sy):
+    w   = 1.0 / sy**2
+    est = np.sum(w * by * bx / sx) / np.sum(w * bx**2 / sx**2)
+    se  = np.sqrt(1.0 / np.sum(w * bx**2 / sx**2))
+    z   = est / se
+    p   = 2 * (1 - norm_cdf(abs(z)))
+    return est, se, z, p
+
+# Exposure traits with ≥10 instruments
+exp_cols = [c for c in range(100)
+            if np.sum(np.abs(zscore_orig[:, c]) > Z_THRESH) >= 10][:5]
+print(f"Exposure traits with ≥10 instruments: {len(exp_cols)} selected")
+```
+
+```{python}
+def reconstruct_rows_col(rows, ld_path, col, array="beta"):
+    zs  = zarr.open(str(ld_path), mode="r")
+    bi  = json.loads((ld_path / "block_index.json").read_text())
+    evp = np.load(str(EIGVEC_DIR / "eigenvectors.npz"))
+    rows_set = set(rows)
+    result   = np.full(len(rows), np.nan, dtype=np.float32)
+    row_out  = {r: i for i, r in enumerate(rows)}
+    for b in bi:
+        K = b["K"]
+        if K == 0:
+            continue
+        overlap = [(li, gr) for li, gr in enumerate(b["zarr_row_indices"]) if gr in rows_set]
+        if not overlap:
+            continue
+        local_idx  = np.array([li for li, _ in overlap], dtype=np.intp)
+        global_idx = [gr for _, gr in overlap]
+        V = evp[f"b{b['block_id']}"][local_idx, :K]  # (n_overlap, K)
+        C = zs[f"coefficients_{array}"][b["coeff_row_start"]:b["coeff_row_end"], col]  # (K,)
+        recon = V @ C
+        for i, gr in enumerate(global_idx):
+            result[row_out[gr]] = recon[i]
+    # Passthrough
+    if "passthrough_row_indices" in zs:
+        pt = zs["passthrough_row_indices"][:]
+        pt_set = set(pt.tolist())
+        for i, r in enumerate(rows):
+            if r in pt_set:
+                pt_local = int(np.searchsorted(pt, r))
+                result[i] = float(zs[f"passthrough_{array}"][pt_local, col])
+    # NaN mask
+    for i, r in enumerate(rows):
+        if zs["nan_mask"][r, col]:
+            result[i] = np.nan
+    return result
+
+mr_rows = []
+
+for exp_col in exp_cols:
+    out_cols = [c for c in range(100) if c != exp_col][:2]
+    for out_col in out_cols:
+        # Instruments
+        z_exp     = zscore_orig[:, exp_col]
+        inst_rows = np.where(np.abs(z_exp) > Z_THRESH)[0]
+        bx_raw    = beta_orig[inst_rows, exp_col]
+        zx_raw    = z_exp[inst_rows].astype(np.float32)
+        sx_raw    = np.abs(bx_raw / zx_raw)
+
+        by_raw    = beta_orig[inst_rows, out_col]
+        zy_raw    = zscore_orig[inst_rows, out_col].astype(np.float32)
+        sy_raw    = np.abs(by_raw / zy_raw)
+
+        valid = (np.isfinite(bx_raw) & np.isfinite(sx_raw) &
+                 np.isfinite(by_raw) & np.isfinite(sy_raw) &
+                 (sx_raw > 0) & (sy_raw > 0))
+        if valid.sum() < 3:
+            continue
+
+        raw_est, _, _, raw_p = ivw_mr(bx_raw[valid], sx_raw[valid],
+                                       by_raw[valid], sy_raw[valid])
+
+        for ld_name, ld_path in LD_STORES.items():
+            by_ld = reconstruct_rows_col(inst_rows[valid].tolist(), ld_path, out_col, "beta")
+            zy_ld = reconstruct_rows_col(inst_rows[valid].tolist(), ld_path, out_col, "zscore")
+            sy_ld = np.abs(by_ld / (zy_ld + 1e-30))
+
+            valid2 = np.isfinite(by_ld) & np.isfinite(sy_ld) & (sy_ld > 0)
+            if valid2.sum() < 3:
+                continue
+
+            ld_est, _, _, ld_p = ivw_mr(bx_raw[valid][valid2], sx_raw[valid][valid2],
+                                          by_ld[valid2], sy_ld[valid2])
+
+            rel_err  = abs(ld_est - raw_est) / (abs(raw_est) + 1e-10)
+            logp_diff = abs(np.log10(max(ld_p, 1e-300)) - np.log10(max(raw_p, 1e-300)))
+            passed   = rel_err < 0.01 and logp_diff < 0.5
+
+            exp_id = meta["trait_ids"][exp_col]
+            out_id = meta["trait_ids"][out_col]
+
+            mr_rows.append({
+                "store":       ld_name,
+                "exposure":    exp_id,
+                "outcome":     out_id,
+                "n_inst":      int(valid2.sum()),
+                "raw_est":     float(raw_est),
+                "ld_est":      float(ld_est),
+                "rel_err_pct": float(rel_err * 100),
+                "logp_diff":   float(logp_diff),
+                "pass":        passed,
+            })
+
+mr_df = pd.DataFrame(mr_rows)
+mr_df[["store","exposure","outcome","n_inst",
+       "raw_est","ld_est","rel_err_pct","logp_diff","pass"]]
+```
+
+```{python}
+summary_mr = mr_df.groupby("store").agg(
+    n_pairs=("pass", "count"),
+    n_pass=("pass", "sum"),
+    max_rel_err_pct=("rel_err_pct", "max"),
+    max_logp_diff=("logp_diff", "max"),
+).reset_index()
+summary_mr["all_pass"] = summary_mr["n_pass"] == summary_mr["n_pairs"]
+summary_mr
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for ax, col, label in [
+    (axes[0], "rel_err_pct", "Relative error (%)"),
+    (axes[1], "logp_diff",   "Δlog₁₀p"),
+]:
+    for ld_name in LD_STORES:
+        subset = mr_df[mr_df.store == ld_name][col]
+        ax.scatter([ld_name] * len(subset), subset, alpha=0.7, s=40)
+    if col == "rel_err_pct":
+        ax.axhline(1.0,  color="red", linestyle="--", linewidth=1, label="1% tolerance")
+    else:
+        ax.axhline(0.5, color="red", linestyle="--", linewidth=1, label="0.5 tolerance")
+    ax.set_ylabel(label)
+    ax.set_title(f"MR precision — {label}")
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig("ld_mr_precision.png", dpi=120)
+plt.show()
+```
+
+## Conclusions
+
+```{python}
+raw_mb   = sizes["raw float16"]
+ld_rows  = []
+for label, ld_path in LD_STORES.items():
+    mb         = store_size_mb(ld_path)
+    ratio      = raw_mb / mb
+    mr_pass    = mr_df[mr_df.store == label]["pass"].all() if len(mr_df) else None
+    max_rel    = mr_df[mr_df.store == label]["rel_err_pct"].max() if len(mr_df) else None
+    ld_rows.append({
+        "Threshold": label,
+        "Size (MB)": f"{mb:.0f}",
+        "vs raw float16": f"{ratio:.1f}×",
+        "vs VCF": f"{vcf_size/mb:.1f}×",
+        "MR all pass": "✓" if mr_pass else "✗",
+        "Max rel err (%)": f"{max_rel:.2f}" if max_rel is not None else "—",
+    })
+pd.DataFrame(ld_rows)
+```
+
+```{python}
+print("Key findings:")
+print()
+
+# Best ratio
+best = max(LD_STORES, key=lambda k: raw_mb / store_size_mb(LD_STORES[k]))
+best_ratio = raw_mb / store_size_mb(LD_STORES[best])
+print(f"• Best compression: {best} at {best_ratio:.1f}× vs raw float16")
+print(f"  (zstd+bitshuffle achieves {raw_mb / sizes['zstd+bitshuffle']:.1f}× by comparison)")
+print()
+
+# MR precision
+for label in LD_STORES:
+    sub = mr_df[mr_df.store == label]
+    if len(sub) == 0:
+        continue
+    n_pass = sub["pass"].sum()
+    n_tot  = len(sub)
+    max_re = sub["rel_err_pct"].max()
+    print(f"• {label}: {n_pass}/{n_tot} pairs pass, max rel err {max_re:.2f}%")
+
+print()
+print("• Bulk query overhead: LD reconstruction scans all blocks per column;")
+lats = latency_df[latency_df["query"] == "bulk"].set_index("store")["median_ms"]
+for name in ["raw_float16"] + list(LD_STORES.keys()):
+    if name in lats.index:
+        print(f"    {name}: {lats[name]:.0f} ms")
+```
