@@ -14,12 +14,11 @@ Non-contiguous row reads (regional query):
   contiguous runs and one slice per run is issued, then results concatenated.
   This faithfully reflects TileDB's actual access pattern.
 
-Output: data/tiledb_query_benchmark_results.json
-
 Usage:
-    python dense_05t_query_benchmark.py
+    python dense_05t_query_benchmark.py [--prefix ukb-chr1]
 """
 
+import argparse
 import json
 import subprocess
 import time
@@ -29,17 +28,30 @@ import pandas as pd
 import tiledb
 
 TABIX = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
-STORES = {
-    "raw_float16": "data/ukb-chr1.besdt",
-    "zstd_bitshuffle": "data/ukb-chr1-zstd.besdt",
-}
 N_REPS = 10
 REGION = ("1", 100_000_000, 101_000_000)
 PHEWAS_POS = ("1", 100_500_000)
 RNG = np.random.default_rng(42)
 N_RANDOM_VARIANTS = 100
 N_RANDOM_TRAITS = 10
-OUTPUT_JSON = "data/tiledb_query_benchmark_results.json"
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--prefix", default="ukb-chr1",
+                   help="Store name prefix under data/ (default: ukb-chr1)")
+    return p.parse_args()
+
+
+def get_stores(prefix):
+    return {
+        "raw_float16":    f"data/{prefix}.besdt",
+        "zstd_bitshuffle": f"data/{prefix}-zstd.besdt",
+    }
+
+
+def get_output_json(prefix):
+    return f"data/{prefix}_tiledb_benchmark.json"
 
 
 def load_keys(store_dir: str) -> dict:
@@ -124,9 +136,14 @@ def query_tophits(store_dir: str, trait_col: int) -> pd.DataFrame:
         return pd.DataFrame({"row": [], "beta": [], "z": []})
     with tiledb.open(f"{store_dir}/sig_5e8", mode="r") as A:
         hit_rows = A[start:end]["data"].astype(np.int64)
-    beta = tiledb_read_rows(f"{store_dir}/beta", hit_rows)[:, trait_col]
-    z_vals = tiledb_read_rows(f"{store_dir}/zscore", hit_rows)[:, trait_col]
-    return pd.DataFrame({"row": hit_rows, "beta": beta, "z": z_vals})
+    # TileDB has no efficient scatter-gather: hit rows are scattered across 97% of
+    # the array, producing ~4875 separate tile reads via tiledb_read_rows. Reading
+    # the full column and indexing is ~6× fewer tile reads (same as query_bulk).
+    with tiledb.open(f"{store_dir}/beta", mode="r") as A:
+        beta_col = A[:, trait_col]["data"].view(np.float16)
+    with tiledb.open(f"{store_dir}/zscore", mode="r") as A:
+        z_col = A[:, trait_col]["data"].view(np.float16)
+    return pd.DataFrame({"row": hit_rows, "beta": beta_col[hit_rows], "z": z_col[hit_rows]})
 
 
 def query_random_lookup(store_dir: str, row_indices: np.ndarray, col_indices: np.ndarray) -> np.ndarray:
@@ -152,6 +169,10 @@ def bench(fn, n=N_REPS):
 
 
 def main():
+    args = parse_args()
+    STORES = get_stores(args.prefix)
+    OUTPUT_JSON = get_output_json(args.prefix)
+
     print(f"{'Store':<20} {'Query':<12} {'median ms':>10} {'p95 ms':>10} {'result'}")
     print("-" * 70)
 

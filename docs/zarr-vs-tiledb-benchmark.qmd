@@ -1,6 +1,6 @@
 ---
 title: "Zarr vs TileDB — Backend Comparison"
-subtitle: "chr1 × 100 UK Biobank traits · `.besdz` vs `.besdt`"
+subtitle: "chr1 × 100 and 1000 UK Biobank traits · `.besdz` vs `.besdt`"
 date: today
 format:
   html:
@@ -19,15 +19,17 @@ This report compares two dense storage backends for GWAS summary statistics:
 - **`.besdt`** — TileDB-based (BitShuffle + Zstd filters)
 
 Both backends store the same data: a (N_variants × N_traits) float16 matrix of
-beta estimates and z-scores for chromosome 1 (762,488 variants × 100 UKB traits),
-using chunk/tile size of 1,000 rows. Each backend provides raw (no compression)
-and zstd+bitshuffle compressed variants.
+beta estimates and z-scores for chromosome 1 (762,488 variants), using chunk/tile
+size of 1,000 rows. Each backend provides raw (no compression) and zstd+bitshuffle
+compressed variants. Benchmarks are run at two trait counts (100 and 1000) to
+assess scaling.
 
-Three questions:
+Four questions:
 
 1. **Storage** — how do the two backends compare on disk footprint?
-2. **Query latency** — regional, PheWAS, top-hits, and bulk query speeds?
-3. **MR precision** — does the choice of backend affect float16 encoding fidelity?
+2. **Query latency** — regional, PheWAS, top-hits, bulk, and random-lookup speeds at 100 traits?
+3. **Scaling** — how does query latency scale from 100 to 1000 traits?
+4. **MR precision** — does the choice of backend affect float16 encoding fidelity?
 
 > **Regional query note**: Zarr uses `oindex[indices, :]` for non-contiguous
 > row access. TileDB has no direct equivalent; the implementation groups sorted
@@ -55,12 +57,25 @@ STORE_ZARR_RAW  = Path("../data/ukb-chr1.besdz")
 STORE_ZARR_ZSTD = Path("../data/ukb-chr1-zstd.besdz")
 STORE_TDB_RAW   = Path("../data/ukb-chr1.besdt")
 STORE_TDB_ZSTD  = Path("../data/ukb-chr1-zstd.besdt")
+
+STORE_ZARR_RAW_1K  = Path("../data/ukb-chr1-1000.besdz")
+STORE_ZARR_ZSTD_1K = Path("../data/ukb-chr1-1000-zstd.besdz")
+STORE_TDB_RAW_1K   = Path("../data/ukb-chr1-1000.besdt")
+STORE_TDB_ZSTD_1K  = Path("../data/ukb-chr1-1000-zstd.besdt")
+
+ZARR_JSON_100  = Path("../data/ukb-chr1_zarr_benchmark.json")
+TDB_JSON_100   = Path("../data/ukb-chr1_tiledb_benchmark.json")
+ZARR_JSON_1K   = Path("../data/ukb-chr1-1000_zarr_benchmark.json")
+TDB_JSON_1K    = Path("../data/ukb-chr1-1000_tiledb_benchmark.json")
+
 VCF_DIR         = Path("../data/vcf-ukb")
 TABIX           = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
 Z_THRESH        = 5.45
 
 meta = json.loads((STORE_ZARR_RAW / "metadata.json").read_text())
-print(f"Variants: {meta['n_variants']:,}   Traits: {meta['n_traits']}")
+meta1k = json.loads((STORE_ZARR_RAW_1K / "metadata.json").read_text())
+print(f"100-trait store:  {meta['n_variants']:,} variants × {meta['n_traits']} traits")
+print(f"1000-trait store: {meta1k['n_variants']:,} variants × {meta1k['n_traits']} traits")
 ```
 
 ## Storage
@@ -153,8 +168,8 @@ plt.show()
 ## Query Latency
 
 ```{python}
-ZARR_JSON = Path("../data/query_benchmark_results.json")
-TDB_JSON  = Path("../data/tiledb_query_benchmark_results.json")
+ZARR_JSON = ZARR_JSON_100
+TDB_JSON  = TDB_JSON_100
 
 def load_keys(store_dir):
     keys = np.load(str(store_dir / "variant_keys.npy"), allow_pickle=True)
@@ -287,13 +302,18 @@ def run_tiledb_benchmarks():
             with tiledb.open(bu, mode="r") as A:
                 return A[r, :]["data"].view(np.float16)
 
-        def q_tophits(ou=off_uri, su=sig_uri, bu=beta_uri, tc=c):
+        def q_tophits(ou=off_uri, su=sig_uri, bu=beta_uri, zsu=str(store_dir / "zscore"), tc=c):
             with tiledb.open(ou, mode="r") as A:
                 offsets = A[:]["data"]
             s, e = int(offsets[tc]), int(offsets[tc + 1])
+            if e <= s:
+                return np.array([])
             with tiledb.open(su, mode="r") as A:
-                hit_rows = A[s:e]["data"].astype(np.int64) if e > s else np.array([], dtype=np.int64)
-            return tiledb_read_rows(bu, hit_rows)[:, tc] if len(hit_rows) else np.array([])
+                hit_rows = A[s:e]["data"].astype(np.int64)
+            # Full column read + filter: avoids ~4875 scattered tile reads for dispersed hits
+            with tiledb.open(bu, mode="r") as A:
+                beta_col = A[:, tc]["data"].view(np.float16)
+            return beta_col[hit_rows]
 
         def q_bulk(bu=beta_uri, tc=c):
             with tiledb.open(bu, mode="r") as A:
@@ -566,6 +586,86 @@ all_pass = mr_df["pass"].all()
 print("Overall:", "ALL PASS ✓" if all_pass else "SOME FAIL ✗")
 ```
 
+## Scaling: 100 vs 1000 traits
+
+```{python}
+zarr_100 = json.loads(ZARR_JSON_100.read_text())
+tdb_100  = json.loads(TDB_JSON_100.read_text())
+zarr_1k  = json.loads(ZARR_JSON_1K.read_text())
+tdb_1k   = json.loads(TDB_JSON_1K.read_text())
+
+scale_rows = []
+for q_key, q_label in query_labels.items():
+    z100 = zarr_100["raw_float16"][q_key]["median_ms"]
+    z1k  = zarr_1k["raw_float16"][q_key]["median_ms"]
+    t100 = tdb_100["raw_float16"][q_key]["median_ms"]
+    t1k  = tdb_1k["raw_float16"][q_key]["median_ms"]
+    scale_rows.append({
+        "Query":            q_label,
+        "Zarr 100 (ms)":   round(z100, 1),
+        "Zarr 1000 (ms)":  round(z1k, 1),
+        "Zarr scale":      f"{z1k/z100:.1f}×",
+        "TileDB 100 (ms)": round(t100, 1),
+        "TileDB 1000 (ms)":round(t1k, 1),
+        "TileDB scale":    f"{t1k/t100:.1f}×",
+    })
+
+scale_df = pd.DataFrame(scale_rows)
+scale_df
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=False)
+
+queries = [r["Query"] for r in scale_rows]
+x = np.arange(len(queries))
+w = 0.35
+
+for ax, (backend, d100, d1k, color) in zip(
+    axes,
+    [("Zarr",   zarr_100, zarr_1k,  "#4C72B0"),
+     ("TileDB", tdb_100,  tdb_1k,   "#DD8452")],
+):
+    vals_100 = [d100["raw_float16"][q]["median_ms"] for q in query_labels]
+    vals_1k  = [d1k["raw_float16"][q]["median_ms"]  for q in query_labels]
+    ax.bar(x - w/2, vals_100, w, label="100 traits", color=color, alpha=0.9)
+    ax.bar(x + w/2, vals_1k,  w, label="1000 traits", color=color, alpha=0.4)
+    ax.set_xticks(x)
+    ax.set_xticklabels([r["Query"] for r in scale_rows], rotation=20, ha="right")
+    ax.set_yscale("log")
+    ax.set_ylabel("Median latency (ms, log scale)")
+    ax.set_title(f"{backend}: 100 vs 1000 traits (raw)")
+    ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Scale factor heatmap
+scale_mat = np.array([
+    [zarr_1k["raw_float16"][q]["median_ms"] / zarr_100["raw_float16"][q]["median_ms"]
+     for q in query_labels],
+    [tdb_1k["raw_float16"][q]["median_ms"]  / tdb_100["raw_float16"][q]["median_ms"]
+     for q in query_labels],
+])
+
+fig, ax = plt.subplots(figsize=(9, 2.5))
+im = ax.imshow(scale_mat, cmap="YlOrRd", aspect="auto", vmin=1, vmax=20)
+ax.set_xticks(range(len(query_labels)))
+ax.set_xticklabels([r["Query"] for r in scale_rows], rotation=20, ha="right")
+ax.set_yticks([0, 1])
+ax.set_yticklabels(["Zarr", "TileDB"])
+for i in range(2):
+    for j in range(len(query_labels)):
+        ax.text(j, i, f"{scale_mat[i, j]:.1f}×", ha="center", va="center",
+                fontsize=10, color="black" if scale_mat[i, j] < 12 else "white")
+plt.colorbar(im, ax=ax, label="Scale factor (1000 traits / 100 traits)")
+ax.set_title("Latency scale factor: 1000 traits vs 100 traits (raw stores)")
+plt.tight_layout()
+plt.show()
+```
+
 ## Conclusions
 
 ```{python}
@@ -596,14 +696,19 @@ the container.
 
 **Query latency**: For queries that access contiguous data (PheWAS single row,
 bulk column), both backends perform similarly. For any query requiring
-non-contiguous row access, TileDB is dramatically slower:
+non-contiguous row access, TileDB requires a different strategy:
 
-- *Top hits* (6,762 scattered rows via sig index): TileDB raw ~89 s vs Zarr raw
-  ~20 ms — a **~4,000× difference**. TileDB has no scatter-gather primitive for
-  dense arrays; the contiguous-run grouping degenerates to ~6,762 individual tile
-  reads when hits are spread across the array.
-- *Random lookup* (100 random SNPs × 10 traits): TileDB raw ~960 ms vs Zarr raw
-  ~7 ms — a **~140× difference**. 100 random rows yield ~100 separate tile reads.
+- *Top hits* (6,762 scattered rows via sig index): TileDB raw ~300 ms vs Zarr raw
+  ~20 ms — a **~15× difference**. TileDB has no scatter-gather primitive for
+  dense arrays; hits are spread across 97% of chr1 (738K-row range), so the
+  implementation reads the full column and filters by index — effectively the same
+  IO as a bulk query. Zarr's `oindex` resolves all hit rows in a single
+  vectorised operation.
+- *Regional* (3,253 variants in a 1 Mb window): TileDB raw ~24 ms vs Zarr raw
+  ~3 ms (~8×). Contiguous-run grouping limits scattered tile reads.
+- *Random lookup* (100 random SNPs × 10 traits): TileDB raw ~1 s vs Zarr raw
+  ~7 ms — a **~140× difference**. 100 random rows yield ~100 separate tile
+  reads; no efficient fallback exists here.
 
 Zarr's `oindex` handles non-contiguous row access as a single vectorised
 operation, which is fundamental to this workload.
@@ -612,9 +717,27 @@ operation, which is fundamental to this workload.
 <0.5 Δlog₁₀p) for both backends and both compression settings, confirming
 that neither container introduces meaningful float16 precision loss.
 
-**Recommendation**: **Zarr is the clear choice** for this workload. TileDB's
-scatter-gather limitation makes it unsuitable for top-hits and random-SNP queries
-at any scale. The only scenario where TileDB would be competitive is one where
-all queries access contiguous row ranges — which is not the case here. Zarr's
-simpler API, smaller raw footprint, and efficient `oindex` for non-contiguous
-access make it the better backend for dense GWAS summary statistics.
+**Scaling with trait count**: Both backends use (1000 rows × N_traits) tiles/chunks,
+so all tile reads load 10× more data when going from 100 to 1000 traits. The key
+difference is in *how many* tile reads each query triggers:
+
+- **Zarr** scales poorly for scattered-access queries (tophits 39×, random lookup
+  17×) because `oindex` must fetch one chunk per hit row, and each chunk is now
+  10× larger. Bulk and regional scale ~7–9× (near-linear with traits).
+- **TileDB** scales far better for those same queries (regional 1.4×, phewas 1.1×,
+  random lookup 1.2×) because TileDB's fixed overhead per tile read dominates over
+  data transfer at small tile sizes. Tophits (4×) and bulk (3.6×) scale more but
+  still well below linear.
+
+At 1000 traits the backends converge: Zarr tophits (750 ms) vs TileDB tophits
+(1234 ms) is only 1.6× — compared to 16× at 100 traits. TileDB's scatter-gather
+weakness diminishes as trait count grows because the full-column fallback amortises
+its overhead across a much larger column read.
+
+**Recommendation**: **Zarr is the clear choice** at 100 traits. At 1000 traits the
+gap narrows considerably, but Zarr remains faster for non-contiguous queries. For
+even larger trait counts (≥ 5,000), TileDB's fixed-overhead tile model may become
+competitive for bulk and regional queries while Zarr's `oindex` retains the edge
+for tophits and random lookups. Zarr's simpler API, smaller raw footprint, and
+mature Python ecosystem make it the better default choice for dense GWAS summary
+statistics.

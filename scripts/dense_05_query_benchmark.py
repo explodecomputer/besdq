@@ -9,27 +9,44 @@ Query patterns:
   5. random_lookup  — 100 random variants × 10 random traits
 
 Usage:
-    python dense_05_query_benchmark.py
+    python dense_05_query_benchmark.py [--prefix ukb-chr1]
 """
 
+import argparse
+import json
 import subprocess
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import zarr
 
 TABIX = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
-STORES = {
-    "raw_float16": "data/ukb-chr1.besdz",
-    "zstd_bitshuffle": "data/ukb-chr1-zstd.besdz",
-}
 N_REPS = 10
 REGION = ("1", 100_000_000, 101_000_000)  # 1 Mb window on chr1
 PHEWAS_POS = ("1", 100_500_000)
 RNG = np.random.default_rng(42)
 N_RANDOM_VARIANTS = 100
 N_RANDOM_TRAITS = 10
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--prefix", default="ukb-chr1",
+                   help="Store name prefix under data/ (default: ukb-chr1)")
+    return p.parse_args()
+
+
+def get_stores(prefix):
+    return {
+        "raw_float16":    f"data/{prefix}.besdz",
+        "zstd_bitshuffle": f"data/{prefix}-zstd.besdz",
+    }
+
+
+def get_output_json(prefix):
+    return f"data/{prefix}_zarr_benchmark.json"
 
 
 def tabix_row_indices(store_dir: str, chrom: str, start: int, end: int) -> np.ndarray:
@@ -122,8 +139,14 @@ def bench(fn, n=N_REPS):
 
 
 def main():
+    args = parse_args()
+    STORES = get_stores(args.prefix)
+    output_json = get_output_json(args.prefix)
+
     print(f"{'Store':<20} {'Query':<12} {'median ms':>10} {'p95 ms':>10} {'result'}")
     print("-" * 70)
+
+    all_results = {}
 
     # Random indices shared across stores for a fair comparison
     first_store = next(iter(STORES.values()))
@@ -134,6 +157,10 @@ def main():
     rand_cols = np.sort(RNG.choice(n_traits, N_RANDOM_TRAITS, replace=False))
 
     for store_name, store_dir in STORES.items():
+        import os
+        if not os.path.isdir(store_dir):
+            print(f"  [SKIP] {store_dir} not found")
+            continue
         store = zarr.open(store_dir, mode="r")
         key_to_row = load_keys(store_dir)
 
@@ -154,8 +181,10 @@ def main():
             "random_lookup": lambda s=store, ri=rand_rows, ci=rand_cols: query_random_lookup(s, ri, ci),
         }
 
+        store_results = {}
         for q_name, fn in queries.items():
             med, p95, result = bench(fn)
+            store_results[q_name] = {"median_ms": round(med, 3), "p95_ms": round(p95, 3)}
             if isinstance(result, pd.DataFrame) and "n_variants" in result.columns:
                 summary = f"{result['n_variants'].iloc[0]} variants"
             elif isinstance(result, pd.DataFrame):
@@ -166,7 +195,12 @@ def main():
                 summary = str(result)
             print(f"{store_name:<20} {q_name:<16} {med:>10.1f} {p95:>10.1f}  {summary}")
 
+        all_results[store_name] = store_results
         print()
+
+    with open(output_json, "w") as fh:
+        json.dump(all_results, fh, indent=2)
+    print(f"Results written to {output_json}")
 
 
 if __name__ == "__main__":
