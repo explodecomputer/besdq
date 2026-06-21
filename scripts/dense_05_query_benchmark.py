@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Issue 05: Query latency benchmark across four query patterns and two stores.
+"""Issue 05: Query latency benchmark across five query patterns and two stores.
 
 Query patterns:
-  1. regional  — all variants in a 1 Mb window, all traits
-  2. phewas    — single variant (by position) across all traits
-  3. tophits   — variants with |Z| > 5.45 (p<5e-8) for one trait
-  4. bulk      — all variants for one trait
+  1. regional       — all variants in a 1 Mb window, all traits
+  2. phewas         — single variant (by position) across all traits
+  3. tophits        — GW-significant variants for one trait (via sig index)
+  4. bulk           — all variants for one trait
+  5. random_lookup  — 100 random variants × 10 random traits
 
 Usage:
     python dense_05_query_benchmark.py
@@ -26,8 +27,9 @@ STORES = {
 N_REPS = 10
 REGION = ("1", 100_000_000, 101_000_000)  # 1 Mb window on chr1
 PHEWAS_POS = ("1", 100_500_000)
-TOPHITS_TRAIT = 0
-Z_THRESHOLD = 5.45   # ~p < 5e-8
+RNG = np.random.default_rng(42)
+N_RANDOM_VARIANTS = 100
+N_RANDOM_TRAITS = 10
 
 
 def tabix_row_indices(store_dir: str, chrom: str, start: int, end: int) -> np.ndarray:
@@ -84,11 +86,24 @@ def query_phewas(store, row_idx: int) -> pd.DataFrame:
     return pd.DataFrame({"beta": beta, "zscore": zscore})
 
 
-def query_tophits(store, trait_col: int, z_thresh: float) -> pd.DataFrame:
-    z_col = store["zscore"][:, trait_col]
-    hit_rows = np.where(np.abs(z_col) > z_thresh)[0]
-    beta = store["beta"][hit_rows, trait_col]
-    return pd.DataFrame({"row": hit_rows, "beta": beta, "z": z_col[hit_rows]})
+def pick_tophits_trait(store) -> int:
+    offsets = store["sig_5e8_offsets"][:]
+    return int(np.argmax(np.diff(offsets)))
+
+
+def query_tophits(store, trait_col: int) -> pd.DataFrame:
+    offsets = store["sig_5e8_offsets"][:]
+    start, end = int(offsets[trait_col]), int(offsets[trait_col + 1])
+    if end <= start:
+        return pd.DataFrame({"row": [], "beta": [], "z": []})
+    hit_rows = store["sig_5e8"][start:end].astype(np.int64)
+    beta = store["beta"].oindex[hit_rows, :][:, trait_col]
+    z = store["zscore"].oindex[hit_rows, :][:, trait_col]
+    return pd.DataFrame({"row": hit_rows, "beta": beta, "z": z})
+
+
+def query_random_lookup(store, row_indices: np.ndarray, col_indices: np.ndarray) -> np.ndarray:
+    return store["beta"].oindex[row_indices, :][:, col_indices]
 
 
 def query_bulk(store, trait_col: int) -> pd.DataFrame:
@@ -110,6 +125,14 @@ def main():
     print(f"{'Store':<20} {'Query':<12} {'median ms':>10} {'p95 ms':>10} {'result'}")
     print("-" * 70)
 
+    # Random indices shared across stores for a fair comparison
+    first_store = next(iter(STORES.values()))
+    _first = zarr.open(first_store, mode="r")
+    n_variants = _first["beta"].shape[0]
+    n_traits = _first["beta"].shape[1]
+    rand_rows = np.sort(RNG.choice(n_variants, N_RANDOM_VARIANTS, replace=False))
+    rand_cols = np.sort(RNG.choice(n_traits, N_RANDOM_TRAITS, replace=False))
+
     for store_name, store_dir in STORES.items():
         store = zarr.open(store_dir, mode="r")
         key_to_row = load_keys(store_dir)
@@ -117,16 +140,18 @@ def main():
         chrom, start, end = REGION
         indices = tabix_indices(store_dir, chrom, start, end, key_to_row)
 
-        # PheWAS: find closest variant to PHEWAS_POS
         ph_chrom, ph_pos = PHEWAS_POS
         ph_indices = tabix_indices(store_dir, ph_chrom, ph_pos, ph_pos + 1, key_to_row)
         ph_row = int(ph_indices[0]) if len(ph_indices) > 0 else 0
 
+        tophits_col = pick_tophits_trait(store)
+
         queries = {
-            "regional":  lambda s=store, i=indices: query_regional(s, i),
-            "phewas":    lambda s=store, r=ph_row: query_phewas(s, r),
-            "tophits":   lambda s=store: query_tophits(s, TOPHITS_TRAIT, Z_THRESHOLD),
-            "bulk":      lambda s=store: query_bulk(s, TOPHITS_TRAIT),
+            "regional":      lambda s=store, i=indices: query_regional(s, i),
+            "phewas":        lambda s=store, r=ph_row: query_phewas(s, r),
+            "tophits":       lambda s=store, c=tophits_col: query_tophits(s, c),
+            "bulk":          lambda s=store, c=tophits_col: query_bulk(s, c),
+            "random_lookup": lambda s=store, ri=rand_rows, ci=rand_cols: query_random_lookup(s, ri, ci),
         }
 
         for q_name, fn in queries.items():
@@ -135,9 +160,11 @@ def main():
                 summary = f"{result['n_variants'].iloc[0]} variants"
             elif isinstance(result, pd.DataFrame):
                 summary = f"{len(result)} rows"
+            elif isinstance(result, np.ndarray):
+                summary = f"{result.shape} array"
             else:
                 summary = str(result)
-            print(f"{store_name:<20} {q_name:<12} {med:>10.1f} {p95:>10.1f}  {summary}")
+            print(f"{store_name:<20} {q_name:<16} {med:>10.1f} {p95:>10.1f}  {summary}")
 
         print()
 

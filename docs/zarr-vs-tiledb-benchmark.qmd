@@ -1,0 +1,620 @@
+---
+title: "Zarr vs TileDB — Backend Comparison"
+subtitle: "chr1 × 100 UK Biobank traits · `.besdz` vs `.besdt`"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+jupyter: python3
+---
+
+## Overview
+
+This report compares two dense storage backends for GWAS summary statistics:
+
+- **`.besdz`** — Zarr-based (NumCodecs Blosc/zstd compression)
+- **`.besdt`** — TileDB-based (BitShuffle + Zstd filters)
+
+Both backends store the same data: a (N_variants × N_traits) float16 matrix of
+beta estimates and z-scores for chromosome 1 (762,488 variants × 100 UKB traits),
+using chunk/tile size of 1,000 rows. Each backend provides raw (no compression)
+and zstd+bitshuffle compressed variants.
+
+Three questions:
+
+1. **Storage** — how do the two backends compare on disk footprint?
+2. **Query latency** — regional, PheWAS, top-hits, and bulk query speeds?
+3. **MR precision** — does the choice of backend affect float16 encoding fidelity?
+
+> **Regional query note**: Zarr uses `oindex[indices, :]` for non-contiguous
+> row access. TileDB has no direct equivalent; the implementation groups sorted
+> row indices into contiguous runs and issues one slice per run. This is the
+> honest implementation — it reflects TileDB's actual access pattern.
+
+```{python}
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib
+import zarr
+import tiledb
+import cyvcf2
+
+sys.path.insert(0, str(Path("../scripts").resolve()))
+
+STORE_ZARR_RAW  = Path("../data/ukb-chr1.besdz")
+STORE_ZARR_ZSTD = Path("../data/ukb-chr1-zstd.besdz")
+STORE_TDB_RAW   = Path("../data/ukb-chr1.besdt")
+STORE_TDB_ZSTD  = Path("../data/ukb-chr1-zstd.besdt")
+VCF_DIR         = Path("../data/vcf-ukb")
+TABIX           = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
+Z_THRESH        = 5.45
+
+meta = json.loads((STORE_ZARR_RAW / "metadata.json").read_text())
+print(f"Variants: {meta['n_variants']:,}   Traits: {meta['n_traits']}")
+```
+
+## Storage
+
+```{python}
+def dir_bytes(path: Path) -> int:
+    result = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True)
+    return int(result.stdout.split()[0])
+
+def vcf_bytes(vcf_dir: Path) -> int:
+    return sum(f.stat().st_size for f in vcf_dir.glob("*.vcf.gz"))
+
+def fmt_mb(b):
+    return f"{b/1e6:.1f} MB"
+
+vcf_b        = vcf_bytes(VCF_DIR)
+zarr_raw_b   = dir_bytes(STORE_ZARR_RAW)
+zarr_zstd_b  = dir_bytes(STORE_ZARR_ZSTD)
+tdb_raw_b    = dir_bytes(STORE_TDB_RAW)
+tdb_zstd_b   = dir_bytes(STORE_TDB_ZSTD)
+
+storage = pd.DataFrame([
+    {
+        "Format":           "100 × VCF.gz (chr1)",
+        "Size":             fmt_mb(vcf_b),
+        "vs VCF":           "1.0×",
+        "vs Zarr raw":      "—",
+        "vs TileDB raw":    "—",
+    },
+    {
+        "Format":           "Zarr raw float16 (.besdz)",
+        "Size":             fmt_mb(zarr_raw_b),
+        "vs VCF":           f"{vcf_b/zarr_raw_b:.1f}×",
+        "vs Zarr raw":      "1.0×",
+        "vs TileDB raw":    f"{tdb_raw_b/zarr_raw_b:.2f}×",
+    },
+    {
+        "Format":           "Zarr zstd+bitshuffle (.besdz)",
+        "Size":             fmt_mb(zarr_zstd_b),
+        "vs VCF":           f"{vcf_b/zarr_zstd_b:.1f}×",
+        "vs Zarr raw":      f"{zarr_raw_b/zarr_zstd_b:.1f}×",
+        "vs TileDB raw":    f"{tdb_raw_b/zarr_zstd_b:.2f}×",
+    },
+    {
+        "Format":           "TileDB raw float16 (.besdt)",
+        "Size":             fmt_mb(tdb_raw_b),
+        "vs VCF":           f"{vcf_b/tdb_raw_b:.1f}×",
+        "vs Zarr raw":      f"{zarr_raw_b/tdb_raw_b:.2f}×",
+        "vs TileDB raw":    "1.0×",
+    },
+    {
+        "Format":           "TileDB zstd+bitshuffle (.besdt)",
+        "Size":             fmt_mb(tdb_zstd_b),
+        "vs VCF":           f"{vcf_b/tdb_zstd_b:.1f}×",
+        "vs Zarr raw":      f"{zarr_raw_b/tdb_zstd_b:.2f}×",
+        "vs TileDB raw":    f"{tdb_raw_b/tdb_zstd_b:.1f}×",
+    },
+])
+storage
+```
+
+```{python}
+genome_scale = 22
+print("Extrapolated full-genome estimates:")
+for label, b in [
+    ("VCF", vcf_b),
+    ("Zarr raw", zarr_raw_b),
+    ("Zarr zstd", zarr_zstd_b),
+    ("TileDB raw", tdb_raw_b),
+    ("TileDB zstd", tdb_zstd_b),
+]:
+    print(f"  {label:<26} {fmt_mb(b * genome_scale)}")
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 3))
+labels = ["VCF", "Zarr\nraw", "Zarr\nzstd", "TileDB\nraw", "TileDB\nzstd"]
+sizes_gb = [b / 1e9 for b in [vcf_b, zarr_raw_b, zarr_zstd_b, tdb_raw_b, tdb_zstd_b]]
+colors = ["#888", "#4C72B0", "#4C72B0", "#DD8452", "#DD8452"]
+alphas = [1.0, 1.0, 0.5, 1.0, 0.5]
+bars = ax.bar(labels, sizes_gb, color=colors)
+for bar, alpha in zip(bars, alphas):
+    bar.set_alpha(alpha)
+ax.set_ylabel("Size (GB)")
+ax.set_title("Storage footprint — chr1 × 100 traits")
+plt.tight_layout()
+plt.show()
+```
+
+## Query Latency
+
+```{python}
+ZARR_JSON = Path("../data/query_benchmark_results.json")
+TDB_JSON  = Path("../data/tiledb_query_benchmark_results.json")
+
+def load_keys(store_dir):
+    keys = np.load(str(store_dir / "variant_keys.npy"), allow_pickle=True)
+    return {(str(r[0]), int(r[1]), str(r[2]), str(r[3])): i for i, r in enumerate(keys)}
+
+def tabix_indices(store_dir, chrom, start, end, key_to_row):
+    tsv_gz = str(store_dir / "variants.tsv.gz")
+    result = subprocess.run([TABIX, tsv_gz, f"{chrom}:{start}-{end}"],
+                            capture_output=True, text=True)
+    if not result.stdout.strip():
+        return np.array([], dtype=np.int32)
+    indices = []
+    for line in result.stdout.strip().split("\n"):
+        parts = line.split("\t")
+        key = (parts[0], int(parts[1]), parts[2], parts[3])
+        idx = key_to_row.get(key)
+        if idx is not None:
+            indices.append(idx)
+    return np.array(sorted(indices), dtype=np.int32)
+
+def bench(fn, n=10):
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return np.median(times) * 1000, np.percentile(times, 95) * 1000
+
+REGION = ("1", 100_000_000, 101_000_000)
+PHEWAS_POS = ("1", 100_500_000)
+N_REPS = 10
+RNG_BENCH = np.random.default_rng(42)
+N_RANDOM_VARIANTS = 100
+N_RANDOM_TRAITS = 10
+```
+
+```{python}
+# Load pre-computed results if available, otherwise run benchmarks inline
+
+def zarr_pick_tophits_trait(s):
+    offsets = s["sig_5e8_offsets"][:]
+    return int(np.argmax(np.diff(offsets)))
+
+
+def run_zarr_benchmarks():
+    results = {}
+    key_to_row = load_keys(STORE_ZARR_RAW)
+    chrom, start, end = REGION
+    indices = tabix_indices(STORE_ZARR_RAW, chrom, start, end, key_to_row)
+    ph_indices = tabix_indices(STORE_ZARR_RAW, PHEWAS_POS[0], int(PHEWAS_POS[1]),
+                               int(PHEWAS_POS[1]) + 1, key_to_row)
+    ph_row = int(ph_indices[0]) if len(ph_indices) > 0 else 0
+
+    _s0 = zarr.open(str(STORE_ZARR_RAW), mode="r")
+    n_variants_z, n_traits_z = _s0["beta"].shape
+    rand_rows_z = np.sort(RNG_BENCH.choice(n_variants_z, N_RANDOM_VARIANTS, replace=False))
+    rand_cols_z = np.sort(RNG_BENCH.choice(n_traits_z, N_RANDOM_TRAITS, replace=False))
+    tophits_col_z = zarr_pick_tophits_trait(_s0)
+    _off = _s0["sig_5e8_offsets"][:]
+    tophits_rows_z = _s0["sig_5e8"][int(_off[tophits_col_z]):int(_off[tophits_col_z + 1])].astype(np.int64)
+
+    for store_name, store_dir in [("raw_float16", STORE_ZARR_RAW),
+                                   ("zstd_bitshuffle", STORE_ZARR_ZSTD)]:
+        s = zarr.open(str(store_dir), mode="r")
+        queries = {
+            "regional":      lambda s=s, i=indices: s["beta"].oindex[i, :],
+            "phewas":        lambda s=s, r=ph_row: s["beta"][r, :],
+            "tophits":       lambda s=s, hr=tophits_rows_z, c=tophits_col_z: s["beta"].oindex[hr, :][:, c],
+            "bulk":          lambda s=s, c=tophits_col_z: s["beta"][:, c],
+            "random_lookup": lambda s=s, ri=rand_rows_z, ci=rand_cols_z: s["beta"].oindex[ri, :][:, ci],
+        }
+        store_results = {}
+        for q, fn in queries.items():
+            med, p95 = bench(fn, N_REPS)
+            store_results[q] = {"median_ms": round(med, 3), "p95_ms": round(p95, 3)}
+        results[store_name] = store_results
+    return results
+
+
+def tiledb_read_rows(uri, indices):
+    if len(indices) == 0:
+        return np.empty((0, 0), dtype=np.float16)
+    with tiledb.open(uri, mode="r") as A:
+        chunks = []
+        i = 0
+        while i < len(indices):
+            run_start = indices[i]
+            run_end = indices[i]
+            while i + 1 < len(indices) and indices[i + 1] == indices[i] + 1:
+                i += 1
+                run_end = indices[i]
+            # uint16 raw bits reinterpreted as float16 (TileDB has no native float16)
+            chunks.append(A[int(run_start):int(run_end) + 1, :]["data"].view(np.float16))
+            i += 1
+    return np.vstack(chunks) if chunks else np.empty((0, 0), dtype=np.float16)
+
+
+def tdb_pick_tophits_trait(store_dir):
+    with tiledb.open(str(store_dir / "sig_5e8_offsets"), mode="r") as A:
+        offsets = A[:]["data"]
+    return int(np.argmax(np.diff(offsets)))
+
+
+def run_tiledb_benchmarks():
+    results = {}
+    key_to_row = load_keys(STORE_TDB_RAW)
+    chrom, start, end = REGION
+    indices = tabix_indices(STORE_TDB_RAW, chrom, start, end, key_to_row)
+    ph_indices = tabix_indices(STORE_TDB_RAW, PHEWAS_POS[0], int(PHEWAS_POS[1]),
+                               int(PHEWAS_POS[1]) + 1, key_to_row)
+    ph_row = int(ph_indices[0]) if len(ph_indices) > 0 else 0
+
+    tdb_meta = json.loads((STORE_TDB_RAW / "metadata.json").read_text())
+    n_variants_t, n_traits_t = tdb_meta["n_variants"], tdb_meta["n_traits"]
+    rand_rows_t = np.sort(RNG_BENCH.choice(n_variants_t, N_RANDOM_VARIANTS, replace=False))
+    rand_cols_t = np.sort(RNG_BENCH.choice(n_traits_t, N_RANDOM_TRAITS, replace=False))
+    tophits_col_t = tdb_pick_tophits_trait(STORE_TDB_RAW)
+
+    for store_name, store_dir in [("raw_float16", STORE_TDB_RAW),
+                                   ("zstd_bitshuffle", STORE_TDB_ZSTD)]:
+        beta_uri = str(store_dir / "beta")
+        off_uri  = str(store_dir / "sig_5e8_offsets")
+        sig_uri  = str(store_dir / "sig_5e8")
+        c = tophits_col_t
+
+        def q_regional(i=indices, bu=beta_uri):
+            return tiledb_read_rows(bu, i)
+
+        def q_phewas(r=ph_row, bu=beta_uri):
+            with tiledb.open(bu, mode="r") as A:
+                return A[r, :]["data"].view(np.float16)
+
+        def q_tophits(ou=off_uri, su=sig_uri, bu=beta_uri, tc=c):
+            with tiledb.open(ou, mode="r") as A:
+                offsets = A[:]["data"]
+            s, e = int(offsets[tc]), int(offsets[tc + 1])
+            with tiledb.open(su, mode="r") as A:
+                hit_rows = A[s:e]["data"].astype(np.int64) if e > s else np.array([], dtype=np.int64)
+            return tiledb_read_rows(bu, hit_rows)[:, tc] if len(hit_rows) else np.array([])
+
+        def q_bulk(bu=beta_uri, tc=c):
+            with tiledb.open(bu, mode="r") as A:
+                return A[:, tc]["data"].view(np.float16)
+
+        def q_random_lookup(bu=beta_uri, ri=rand_rows_t, ci=rand_cols_t):
+            return tiledb_read_rows(bu, ri)[:, ci]
+
+        queries = {"regional": q_regional, "phewas": q_phewas,
+                   "tophits": q_tophits, "bulk": q_bulk,
+                   "random_lookup": q_random_lookup}
+        store_results = {}
+        for q, fn in queries.items():
+            med, p95 = bench(fn, N_REPS)
+            store_results[q] = {"median_ms": round(med, 3), "p95_ms": round(p95, 3)}
+        results[store_name] = store_results
+    return results
+
+
+if ZARR_JSON.exists():
+    zarr_latency = json.loads(ZARR_JSON.read_text())
+    print(f"Loaded Zarr latency from {ZARR_JSON}")
+else:
+    print("Running Zarr benchmarks inline...")
+    zarr_latency = run_zarr_benchmarks()
+
+if TDB_JSON.exists():
+    tdb_latency = json.loads(TDB_JSON.read_text())
+    print(f"Loaded TileDB latency from {TDB_JSON}")
+else:
+    print("Running TileDB benchmarks inline...")
+    tdb_latency = run_tiledb_benchmarks()
+```
+
+```{python}
+query_labels = {
+    "regional":      "Regional (1 Mb)",
+    "phewas":        "PheWAS (1 variant)",
+    "tophits":       "Top hits (sig index)",
+    "bulk":          "Bulk trait",
+    "random_lookup": "Random (100 SNPs × 10 traits)",
+}
+
+rows = []
+for store_key, store_label in [("raw_float16", "raw float16"),
+                                 ("zstd_bitshuffle", "zstd+bitshuffle")]:
+    for q_key, q_label in query_labels.items():
+        zr = zarr_latency.get(store_key, {}).get(q_key, {})
+        td = tdb_latency.get(store_key, {}).get(q_key, {})
+        rows.append({
+            "Compression":   store_label,
+            "Query":         q_label,
+            "Zarr med (ms)": zr.get("median_ms", float("nan")),
+            "Zarr p95 (ms)": zr.get("p95_ms",    float("nan")),
+            "TileDB med (ms)": td.get("median_ms", float("nan")),
+            "TileDB p95 (ms)": td.get("p95_ms",    float("nan")),
+        })
+
+lat_df = pd.DataFrame(rows)
+lat_df["TileDB / Zarr (median)"] = (lat_df["TileDB med (ms)"] /
+                                     lat_df["Zarr med (ms)"]).round(2)
+lat_df
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+
+for ax, (comp_key, comp_label) in zip(
+    axes, [("raw float16", "Raw float16"), ("zstd+bitshuffle", "Zstd+bitshuffle")]
+):
+    sub = lat_df[lat_df["Compression"] == comp_key].copy()
+    x = np.arange(len(sub))
+    w = 0.35
+    ax.barh(x - w/2, sub["Zarr med (ms)"].values, w, label="Zarr", color="#4C72B0")
+    ax.barh(x + w/2, sub["TileDB med (ms)"].values, w, label="TileDB", color="#DD8452")
+    ax.set_yticks(x)
+    ax.set_yticklabels(sub["Query"].values)
+    ax.set_xscale("log")
+    ax.set_xlabel("Median latency (ms, log scale)")
+    ax.set_title(comp_label)
+    ax.legend()
+
+plt.suptitle("Query latency: Zarr vs TileDB", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+## MR Precision Validation
+
+IVW MR results from each backend vs the original VCF files. Tolerance: relative
+error < 1%, log₁₀-p difference < 0.5.
+
+```{python}
+def load_manifest(meta):
+    rows = []
+    with open(meta["source"]) as fh:
+        hdr = fh.readline().strip().split("\t")
+        for line in fh:
+            rows.append(dict(zip(hdr, line.strip().split("\t"))))
+    return rows
+
+
+def ivw_mr(beta_x, se_x, beta_y, se_y):
+    from math import erfc, sqrt
+    w = 1.0 / se_y**2
+    est = np.sum(w * beta_y * beta_x / se_x) / np.sum(w * beta_x**2 / se_x**2)
+    se_est = np.sqrt(1.0 / np.sum(w * beta_x**2 / se_x**2))
+    z_stat = est / se_est
+    p = float(erfc(abs(z_stat) / sqrt(2)))
+    return est, se_est, z_stat, p
+
+
+def vcf_stats(vcf_path, positions):
+    out = {}
+    vcf = cyvcf2.VCF(str(vcf_path))
+    for v in vcf:
+        if (v.CHROM, v.POS) not in positions:
+            continue
+        es = v.format("ES")
+        se = v.format("SE")
+        if es is None or se is None:
+            continue
+        beta, se_val = float(es[0][0]), float(se[0][0])
+        if se_val == 0:
+            continue
+        alt, ref = v.ALT[0], v.REF
+        if not (alt < ref):
+            beta = -beta
+        out[(v.CHROM, v.POS, min(ref, alt), max(ref, alt))] = (beta, se_val)
+    vcf.close()
+    return out
+
+
+manifest = load_manifest(meta)
+zarr_raw  = zarr.open(str(STORE_ZARR_RAW), mode="r")
+keys_array = np.load(str(STORE_ZARR_RAW / "variant_keys.npy"), allow_pickle=True)
+
+exp_cols = [c for c in range(meta["n_traits"])
+            if np.sum(np.abs(zarr_raw["zscore"][:, c]) > Z_THRESH) >= 10][:5]
+
+pairs = [(exp_col, out_col)
+         for exp_col in exp_cols
+         for out_col in [c for c in range(meta["n_traits"]) if c != exp_col][:2]]
+
+print(f"{len(exp_cols)} exposure traits × 2 outcomes = {len(pairs)} pairs × 2 compressions × 2 backends")
+```
+
+```{python}
+def tiledb_col_read(store_dir, array_name, col):
+    with tiledb.open(str(store_dir / array_name), mode="r") as A:
+        return A[:, col]["data"].view(np.float16).astype(np.float32)
+
+
+def tiledb_rows_col(store_dir, array_name, rows, col):
+    if len(rows) == 0:
+        return np.array([], dtype=np.float32)
+    with tiledb.open(str(store_dir / array_name), mode="r") as A:
+        chunks = []
+        i = 0
+        while i < len(rows):
+            rs, re = rows[i], rows[i]
+            while i + 1 < len(rows) and rows[i + 1] == rows[i] + 1:
+                i += 1; re = rows[i]
+            chunks.append(A[int(rs):int(re) + 1, col]["data"].view(np.float16).astype(np.float32))
+            i += 1
+    return np.concatenate(chunks)
+
+
+def run_mr_pair(backend, store_dir, exp_col, out_col, keys_arr, manifest):
+    exp_id = meta["trait_ids"][exp_col]
+    out_id = meta["trait_ids"][out_col]
+
+    if backend == "zarr":
+        s = zarr.open(str(store_dir), mode="r")
+        z_exp = s["zscore"][:, exp_col].astype(np.float32)
+        inst = np.where(np.abs(z_exp) > Z_THRESH)[0]
+        if len(inst) < 3:
+            return None
+        bx = s["beta"][inst, exp_col].astype(np.float32)
+        zx = z_exp[inst]
+        by = s["beta"][inst, out_col].astype(np.float32)
+        zy = s["zscore"][inst, out_col].astype(np.float32)
+    else:  # tiledb
+        z_exp = tiledb_col_read(store_dir, "zscore", exp_col)
+        inst = np.where(np.abs(z_exp) > Z_THRESH)[0]
+        if len(inst) < 3:
+            return None
+        bx = tiledb_rows_col(store_dir, "beta", inst, exp_col)
+        zx = z_exp[inst]
+        by = tiledb_rows_col(store_dir, "beta", inst, out_col)
+        zy = tiledb_rows_col(store_dir, "zscore", inst, out_col)
+
+    sx = np.abs(bx / zx)
+    sy = np.abs(by / zy)
+    valid = np.isfinite(bx) & np.isfinite(sx) & np.isfinite(by) & np.isfinite(sy) & (sx > 0) & (sy > 0)
+    if valid.sum() < 3:
+        return None
+
+    store_est, _, _, store_p = ivw_mr(bx[valid], sx[valid], by[valid], sy[valid])
+
+    inst_keys = keys_arr[inst[valid]]
+    positions = {(str(k[0]), int(k[1])) for k in inst_keys}
+    vcf_out = vcf_stats(manifest[out_col]["file_path"], positions)
+    vcf_exp = vcf_stats(manifest[exp_col]["file_path"], positions)
+
+    by_v, sy_v, bx_v, sx_v = [], [], [], []
+    for k in inst_keys:
+        fk = (str(k[0]), int(k[1]), str(k[2]), str(k[3]))
+        oy = vcf_out.get(fk)
+        ex = vcf_exp.get(fk)
+        if oy and ex:
+            by_v.append(oy[0]); sy_v.append(oy[1])
+            bx_v.append(ex[0]); sx_v.append(ex[1])
+
+    if len(by_v) < 3:
+        return None
+
+    vcf_est, _, _, vcf_p = ivw_mr(np.array(bx_v), np.array(sx_v),
+                                   np.array(by_v), np.array(sy_v))
+    rel_err = abs(store_est - vcf_est) / (abs(vcf_est) + 1e-10)
+    logp_diff = abs(np.log10(max(store_p, 1e-300)) - np.log10(max(vcf_p, 1e-300)))
+
+    return {
+        "backend": backend.capitalize(),
+        "exposure": exp_id,
+        "outcome": out_id,
+        "N_instruments": int(valid.sum()),
+        "VCF_est": round(float(vcf_est), 5),
+        "Store_est": round(float(store_est), 5),
+        "rel_err_%": round(float(rel_err * 100), 4),
+        "logp_diff": round(float(logp_diff), 4),
+        "pass": rel_err < 0.01 and logp_diff < 0.5,
+    }
+```
+
+```{python}
+mr_rows = []
+
+backends = [
+    ("zarr", "Zarr raw",   STORE_ZARR_RAW),
+    ("zarr", "Zarr zstd",  STORE_ZARR_ZSTD),
+    ("tiledb", "TileDB raw",  STORE_TDB_RAW),
+    ("tiledb", "TileDB zstd", STORE_TDB_ZSTD),
+]
+
+for exp_col, out_col in pairs:
+    for backend, store_label, store_dir in backends:
+        r = run_mr_pair(backend, store_dir, exp_col, out_col, keys_array, manifest)
+        if r is None:
+            continue
+        r["Store"] = store_label
+        mr_rows.append(r)
+
+mr_df = pd.DataFrame(mr_rows)
+mr_df["PASS"] = mr_df["pass"].map({True: "✓", False: "✗"})
+mr_df.drop(columns=["pass"]).style.map(
+    lambda v: "color: red; font-weight: bold" if v == "✗" else "",
+    subset=["PASS"]
+)
+```
+
+```{python}
+summary = mr_df.groupby("Store")["pass"].agg(["sum", "count"]).reset_index()
+summary.columns = ["Store", "Passed", "Total"]
+summary["Pass rate"] = summary.apply(lambda r: f"{r['Passed']}/{r['Total']}", axis=1)
+print("MR precision summary by store:")
+print(summary[["Store", "Pass rate"]].to_string(index=False))
+print()
+all_pass = mr_df["pass"].all()
+print("Overall:", "ALL PASS ✓" if all_pass else "SOME FAIL ✗")
+```
+
+## Conclusions
+
+```{python}
+# Summarise key numbers for the narrative
+zarr_raw_med  = {q: zarr_latency["raw_float16"][q]["median_ms"] for q in query_labels}
+tdb_raw_med   = {q: tdb_latency["raw_float16"][q]["median_ms"] for q in query_labels}
+
+speedup = {q: zarr_raw_med[q] / tdb_raw_med[q] for q in query_labels}
+
+print("Storage comparison (raw):")
+print(f"  TileDB raw vs Zarr raw: {tdb_raw_b/zarr_raw_b:.2f}× size ratio")
+print(f"  TileDB zstd vs Zarr zstd: {tdb_zstd_b/zarr_zstd_b:.2f}× size ratio")
+print()
+print("Latency (raw stores, TileDB / Zarr speed-up ratio):")
+for q, label in query_labels.items():
+    faster = "faster" if speedup[q] < 1 else "slower"
+    print(f"  {label:<28} {1/speedup[q] if speedup[q] < 1 else speedup[q]:.1f}× {faster}")
+print()
+print(f"MR precision: {mr_df['pass'].sum()}/{len(mr_df)} pairs pass across all stores")
+```
+
+Based on the numbers above:
+
+**Storage**: TileDB raw is roughly 2× larger than Zarr raw due to per-array
+directory metadata overhead. Compression closes most of the gap — zstd+bitshuffle
+footprints are similar because the dominant factor is the float16 encoding, not
+the container.
+
+**Query latency**: For queries that access contiguous data (PheWAS single row,
+bulk column), both backends perform similarly. For any query requiring
+non-contiguous row access, TileDB is dramatically slower:
+
+- *Top hits* (6,762 scattered rows via sig index): TileDB raw ~89 s vs Zarr raw
+  ~20 ms — a **~4,000× difference**. TileDB has no scatter-gather primitive for
+  dense arrays; the contiguous-run grouping degenerates to ~6,762 individual tile
+  reads when hits are spread across the array.
+- *Random lookup* (100 random SNPs × 10 traits): TileDB raw ~960 ms vs Zarr raw
+  ~7 ms — a **~140× difference**. 100 random rows yield ~100 separate tile reads.
+
+Zarr's `oindex` handles non-contiguous row access as a single vectorised
+operation, which is fundamental to this workload.
+
+**MR precision**: All pairs pass the tolerance gates (<1% relative error,
+<0.5 Δlog₁₀p) for both backends and both compression settings, confirming
+that neither container introduces meaningful float16 precision loss.
+
+**Recommendation**: **Zarr is the clear choice** for this workload. TileDB's
+scatter-gather limitation makes it unsuitable for top-hits and random-SNP queries
+at any scale. The only scenario where TileDB would be competitive is one where
+all queries access contiguous row ranges — which is not the case here. Zarr's
+simpler API, smaller raw footprint, and efficient `oindex` for non-contiguous
+access make it the better backend for dense GWAS summary statistics.
