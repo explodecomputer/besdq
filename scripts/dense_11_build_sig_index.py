@@ -43,6 +43,8 @@ def build_sig_index(store_path: str) -> None:
 
     print(f"Loading zscore ({store['zscore'].shape})...")
     Z = store["zscore"][:].astype(np.float32)   # (n_variants, n_traits)
+    print(f"Loading beta ({store['beta'].shape})...")
+    B = store["beta"][:].astype(np.float32)     # (n_variants, n_traits)
     absZ = np.abs(Z)
     is_nan = np.isnan(Z)
 
@@ -52,14 +54,21 @@ def build_sig_index(store_path: str) -> None:
         print(f"  p < {thresh:.0e}  |Z| > {zcut:.4f} ...", end="  ")
 
         flat_parts = []
+        flat_z_parts = []
+        flat_b_parts = []
         offsets = np.zeros(n_traits + 1, dtype=np.int64)
 
         for t in range(n_traits):
-            hits = np.where((absZ[:, t] > zcut) & ~is_nan[:, t])[0].astype(np.uint32)
+            mask = (absZ[:, t] > zcut) & ~is_nan[:, t]
+            hits = np.where(mask)[0].astype(np.uint32)
             flat_parts.append(hits)
+            flat_z_parts.append(Z[mask, t].astype(np.float16))
+            flat_b_parts.append(B[mask, t].astype(np.float16))
             offsets[t + 1] = offsets[t] + len(hits)
 
         flat_arr = np.concatenate(flat_parts) if flat_parts else np.array([], dtype=np.uint32)
+        flat_z = np.concatenate(flat_z_parts) if flat_z_parts else np.array([], dtype=np.float16)
+        flat_b = np.concatenate(flat_b_parts) if flat_b_parts else np.array([], dtype=np.float16)
         n_hits = len(flat_arr)
         print(f"{n_hits:,} hits ({n_hits / n_traits:.0f}/trait avg)")
 
@@ -71,6 +80,14 @@ def build_sig_index(store_path: str) -> None:
         store.create_dataset(
             f"sig_{key}_offsets", data=offsets,
             chunks=(n_traits + 1,), compressor=compressor, dtype="int64", overwrite=True,
+        )
+        store.create_dataset(
+            f"sig_{key}_zscore", data=flat_z,
+            chunks=(chunk_size,), compressor=compressor, dtype="float16", overwrite=True,
+        )
+        store.create_dataset(
+            f"sig_{key}_beta", data=flat_b,
+            chunks=(chunk_size,), compressor=compressor, dtype="float16", overwrite=True,
         )
 
     meta["sig_index"] = {

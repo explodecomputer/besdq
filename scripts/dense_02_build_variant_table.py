@@ -15,10 +15,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import cyvcf2
 import numpy as np
 
 
+BCFTOOLS = "/home/gh13047/miniforge3/envs/bcftools/bin/bcftools"
 TABIX = "/home/gh13047/miniforge3/envs/bcftools/bin/tabix"
 BGZIP = "/home/gh13047/miniforge3/envs/bcftools/bin/bgzip"
 
@@ -55,27 +55,26 @@ def main(manifest_path: str, out_dir: str) -> None:
     for i, row in enumerate(manifest, 1):
         vcf_path = row["file_path"]
         print(f"[{i}/{total_vcfs}] {row['trait_id']}", end="\r", flush=True)
-        vcf = cyvcf2.VCF(vcf_path)
-        af_idx = vcf.samples.index(vcf.samples[0]) if vcf.samples else 0
 
-        for variant in vcf:
-            ref = variant.REF
-            alts = variant.ALT
-            if len(alts) != 1:
-                continue  # skip multi-allelic
-            alt = alts[0]
-            chrom = variant.CHROM
-            pos = variant.POS
-            rsid = variant.ID or "."
+        cmd = [BCFTOOLS, "query", "-f", "%CHROM\t%POS\t%REF\t%ALT\t%ID\t[%AF]\n", vcf_path]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        for line in proc.stdout:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 6:
+                continue
+            chrom, pos_str, ref, alt, rsid = parts[0], parts[1], parts[2], parts[3], parts[4]
+            if "," in alt:
+                continue
+            rsid = rsid if rsid and rsid != "." else "."
+            try:
+                af = float(parts[5])
+            except ValueError:
+                continue
 
+            pos = int(pos_str)
             a1, a2, flip = alid(chrom, pos, ref, alt)
             key = (chrom, pos, a1, a2)
 
-            # AF FORMAT field: frequency of ALT allele in study
-            af_vals = variant.format("AF")
-            if af_vals is None:
-                continue
-            af = float(af_vals[0][0])
             # EAF of A1: if no flip, A1=ALT so eaf_a1=AF; if flip, A1=REF so eaf_a1=1-AF
             eaf_a1 = af if not flip else 1.0 - af
 
@@ -84,11 +83,12 @@ def main(manifest_path: str, out_dir: str) -> None:
             else:
                 variants[key][0] += eaf_a1
                 variants[key][1] += 1
-                # keep rsid if we don't have one yet
                 if variants[key][2] == "." and rsid != ".":
                     variants[key][2] = rsid
 
-        vcf.close()
+        proc.wait()
+        if proc.returncode != 0:
+            print(f"\nWarning: bcftools failed (exit {proc.returncode}) for {vcf_path}", file=sys.stderr)
 
     print(f"\nUnion variant count: {len(variants):,}")
 

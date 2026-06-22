@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BESDQ — Benchmark Reports</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 720px;
+      margin: 60px auto;
+      padding: 0 24px;
+      color: #222;
+      line-height: 1.6;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: 0.25em; }
+    p.subtitle { color: #555; margin-top: 0; margin-bottom: 2em; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { border-top: 1px solid #e8e8e8; padding: 1.2em 0; }
+    li:last-child { border-bottom: 1px solid #e8e8e8; }
+    a.report-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      text-decoration: none;
+      color: #1a5fb4;
+    }
+    a.report-title:hover { text-decoration: underline; }
+    p.desc { margin: 0.3em 0 0; color: #444; font-size: 0.93rem; }
+    .tag {
+      display: inline-block;
+      font-size: 0.75rem;
+      background: #eef3fb;
+      color: #1a5fb4;
+      border-radius: 4px;
+      padding: 1px 7px;
+      margin-right: 4px;
+      font-weight: 500;
+    }
+    footer { margin-top: 3em; font-size: 0.82rem; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>BESDQ — Benchmark Reports</h1>
+  <p class="subtitle">Dense GWAS summary-statistic storage · chr1 × UK Biobank traits</p>
+
+  <ul>
+    <li>
+      <a class="report-title" href="dense-prototype-benchmark.html">Dense Store Prototype</a>
+      <p class="desc">
+        <span class="tag">Zarr</span><span class="tag">100 traits</span>
+        Baseline benchmark of the <code>.besdz</code> Zarr float16 format against
+        bgzipped VCF: storage footprint, query latency (regional, PheWAS, bulk,
+        random), and MR precision validation.
+      </p>
+    </li>
+    <li>
+      <a class="report-title" href="zarr-vs-tiledb-benchmark.html">Zarr vs TileDB</a>
+      <p class="desc">
+        <span class="tag">Zarr</span><span class="tag">TileDB</span><span class="tag">100 &amp; 1000 traits</span>
+        Head-to-head comparison of <code>.besdz</code> (Zarr) vs <code>.besdt</code>
+        (TileDB) at 100 and 1000 traits. Covers storage, all five query patterns,
+        scaling behaviour, and MR precision. Includes co-stored sig-index tophits
+        optimisation (~490× speedup at 100 traits, ~765× at 1000 traits).
+      </p>
+    </li>
+    <li>
+      <a class="report-title" href="sig-index-benchmark.html">Significance Index</a>
+      <p class="desc">
+        <span class="tag">Zarr</span><span class="tag">Sig index</span>
+        Benchmarks the three-threshold significance index (p&nbsp;&lt;&nbsp;5×10⁻⁸,
+        5×10⁻⁶, 10⁻⁴): storage overhead, tophits query latency, and hit-count
+        distributions across traits.
+      </p>
+    </li>
+    <li>
+      <a class="report-title" href="ld-compression-benchmark.html">LD Eigenvector Compression</a>
+      <p class="desc">
+        <span class="tag">Zarr</span><span class="tag">LD</span>
+        Benchmarks LD eigenvector compression of the <code>.besdz</code> store
+        using LDetect EUR blocks and a 1000 Genomes EUR reference panel. Compares
+        storage, reconstruction fidelity, and query latency at multiple variance
+        thresholds (95%, 99%, 99.9%).
+      </p>
+    </li>
+  </ul>
+
+  <footer>Generated from <code>docs/</code> — re-render individual <code>.qmd</code> files with <code>quarto render &lt;file&gt;.qmd</code></footer>
+</body>
+</html>

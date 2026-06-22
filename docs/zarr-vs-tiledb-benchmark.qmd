@@ -49,7 +49,6 @@ import matplotlib.pyplot as plt
 import matplotlib
 import zarr
 import tiledb
-import cyvcf2
 
 sys.path.insert(0, str(Path("../scripts").resolve()))
 
@@ -229,16 +228,17 @@ def run_zarr_benchmarks():
     rand_cols_z = np.sort(RNG_BENCH.choice(n_traits_z, N_RANDOM_TRAITS, replace=False))
     tophits_col_z = zarr_pick_tophits_trait(_s0)
     _off = _s0["sig_5e8_offsets"][:]
-    tophits_rows_z = _s0["sig_5e8"][int(_off[tophits_col_z]):int(_off[tophits_col_z + 1])].astype(np.int64)
 
     for store_name, store_dir in [("raw_float16", STORE_ZARR_RAW),
                                    ("zstd_bitshuffle", STORE_ZARR_ZSTD)]:
         s = zarr.open(str(store_dir), mode="r")
+        c = tophits_col_z
+        off = s["sig_5e8_offsets"][:]
         queries = {
             "regional":      lambda s=s, i=indices: s["beta"].oindex[i, :],
             "phewas":        lambda s=s, r=ph_row: s["beta"][r, :],
-            "tophits":       lambda s=s, hr=tophits_rows_z, c=tophits_col_z: s["beta"].oindex[hr, :][:, c],
-            "bulk":          lambda s=s, c=tophits_col_z: s["beta"][:, c],
+            "tophits":       lambda s=s, off=off, c=c: s["sig_5e8_beta"][int(off[c]):int(off[c+1])],
+            "bulk":          lambda s=s, c=c: s["beta"][:, c],
             "random_lookup": lambda s=s, ri=rand_rows_z, ci=rand_cols_z: s["beta"].oindex[ri, :][:, ci],
         }
         store_results = {}
@@ -426,24 +426,28 @@ def ivw_mr(beta_x, se_x, beta_y, se_y):
     return est, se_est, z_stat, p
 
 
+BCFTOOLS = "/home/gh13047/miniforge3/envs/bcftools/bin/bcftools"
+
 def vcf_stats(vcf_path, positions):
     out = {}
-    vcf = cyvcf2.VCF(str(vcf_path))
-    for v in vcf:
-        if (v.CHROM, v.POS) not in positions:
+    cmd = [BCFTOOLS, "query", "-f", "%CHROM\t%POS\t%REF\t%ALT\t[%ES\t%SE]\n", str(vcf_path)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6:
             continue
-        es = v.format("ES")
-        se = v.format("SE")
-        if es is None or se is None:
+        chrom, pos, ref, alt = parts[0], int(parts[1]), parts[2], parts[3]
+        if "," in alt or (chrom, pos) not in positions:
             continue
-        beta, se_val = float(es[0][0]), float(se[0][0])
+        try:
+            beta, se_val = float(parts[4]), float(parts[5])
+        except ValueError:
+            continue
         if se_val == 0:
             continue
-        alt, ref = v.ALT[0], v.REF
         if not (alt < ref):
             beta = -beta
-        out[(v.CHROM, v.POS, min(ref, alt), max(ref, alt))] = (beta, se_val)
-    vcf.close()
+        out[(chrom, pos, min(ref, alt), max(ref, alt))] = (beta, se_val)
     return out
 
 
@@ -698,46 +702,50 @@ the container.
 bulk column), both backends perform similarly. For any query requiring
 non-contiguous row access, TileDB requires a different strategy:
 
-- *Top hits* (6,762 scattered rows via sig index): TileDB raw ~300 ms vs Zarr raw
-  ~20 ms — a **~15× difference**. TileDB has no scatter-gather primitive for
-  dense arrays; hits are spread across 97% of chr1 (738K-row range), so the
-  implementation reads the full column and filters by index — effectively the same
-  IO as a bulk query. Zarr's `oindex` resolves all hit rows in a single
-  vectorised operation.
-- *Regional* (3,253 variants in a 1 Mb window): TileDB raw ~24 ms vs Zarr raw
-  ~3 ms (~8×). Contiguous-run grouping limits scattered tile reads.
-- *Random lookup* (100 random SNPs × 10 traits): TileDB raw ~1 s vs Zarr raw
-  ~7 ms — a **~140× difference**. 100 random rows yield ~100 separate tile
-  reads; no efficient fallback exists here.
+- *Top hits* (6,762 rows at 100 traits): **Zarr raw 0.7 ms vs TileDB raw 343 ms
+  (~490× faster)**. The sig index now co-stores beta and zscore alongside the
+  variant row indices, so the entire tophits query is a single sequential slice
+  read on a compact array — no scatter-gather into the main matrix at all. TileDB
+  has no equivalent: hits are dispersed across 97% of chr1, so the implementation
+  reads the full column and filters by index, making tophits effectively as slow
+  as a bulk query.
+- *Regional* (3,253 variants in a 1 Mb window): Zarr raw 2.7 ms vs TileDB raw
+  20.6 ms (~8×). Contiguous-run grouping limits but cannot eliminate scattered tile
+  reads.
+- *Random lookup* (100 random SNPs × 10 traits): Zarr raw 7.3 ms vs TileDB raw
+  1,352 ms — a **~185× difference**. 100 random rows yield ~100 separate tile
+  reads in TileDB; no efficient fallback exists.
 
 Zarr's `oindex` handles non-contiguous row access as a single vectorised
-operation, which is fundamental to this workload.
+operation, and the co-stored sig index removes the main-matrix read entirely for
+the tophits pattern.
 
 **MR precision**: All pairs pass the tolerance gates (<1% relative error,
 <0.5 Δlog₁₀p) for both backends and both compression settings, confirming
 that neither container introduces meaningful float16 precision loss.
 
 **Scaling with trait count**: Both backends use (1000 rows × N_traits) tiles/chunks,
-so all tile reads load 10× more data when going from 100 to 1000 traits. The key
-difference is in *how many* tile reads each query triggers:
+so tile reads load 10× more data when going from 100 to 1000 traits. The key
+difference is how each query is served:
 
-- **Zarr** scales poorly for scattered-access queries (tophits 39×, random lookup
-  17×) because `oindex` must fetch one chunk per hit row, and each chunk is now
-  10× larger. Bulk and regional scale ~7–9× (near-linear with traits).
-- **TileDB** scales far better for those same queries (regional 1.4×, phewas 1.1×,
-  random lookup 1.2×) because TileDB's fixed overhead per tile read dominates over
-  data transfer at small tile sizes. Tophits (4×) and bulk (3.6×) scale more but
-  still well below linear.
+- **Zarr tophits scales 1.7×** (0.7 ms → 1.2 ms) because it reads only from the
+  compact co-stored sig index arrays, which grow with hit count (~183 hits/trait)
+  rather than with the full matrix. This is the dominant advantage of the co-stored
+  design.
+- **Zarr random lookup scales 13×** (7.3 ms → 97.8 ms) because `oindex` must fetch
+  one chunk per hit row, and each chunk is 10× larger at 1000 traits.
+- **Zarr bulk scales ~6×** (251 ms → 1,502 ms), near-linear with trait count.
+- **TileDB** scales more gracefully for scattered-access queries (tophits 2.7×,
+  regional 1.4×, random lookup 0.9×) because its fixed per-tile overhead dominates
+  over data transfer at these column sizes. But it starts so much slower that the
+  better scaling doesn't close the gap.
 
-At 1000 traits the backends converge: Zarr tophits (750 ms) vs TileDB tophits
-(1234 ms) is only 1.6× — compared to 16× at 100 traits. TileDB's scatter-gather
-weakness diminishes as trait count grows because the full-column fallback amortises
-its overhead across a much larger column read.
+At 1000 traits: Zarr tophits 1.2 ms vs TileDB 918 ms — still **~765× faster**.
+The co-stored sig index means Zarr's tophits advantage actually widens with trait
+count, not narrows.
 
-**Recommendation**: **Zarr is the clear choice** at 100 traits. At 1000 traits the
-gap narrows considerably, but Zarr remains faster for non-contiguous queries. For
-even larger trait counts (≥ 5,000), TileDB's fixed-overhead tile model may become
-competitive for bulk and regional queries while Zarr's `oindex` retains the edge
-for tophits and random lookups. Zarr's simpler API, smaller raw footprint, and
-mature Python ecosystem make it the better default choice for dense GWAS summary
-statistics.
+**Recommendation**: **Zarr is the clear choice** at all trait counts tested, with
+the co-stored sig index being the decisive factor for the tophits access pattern.
+Zarr's smaller raw footprint, mature `oindex` API, and compact sequential-read
+tophits make it the better default. TileDB's tile model gives better bulk and
+regional scaling, but not enough to offset the tophits gap.

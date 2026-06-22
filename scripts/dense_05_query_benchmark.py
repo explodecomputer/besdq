@@ -114,8 +114,8 @@ def query_tophits(store, trait_col: int) -> pd.DataFrame:
     if end <= start:
         return pd.DataFrame({"row": [], "beta": [], "z": []})
     hit_rows = store["sig_5e8"][start:end].astype(np.int64)
-    beta = store["beta"].oindex[hit_rows, :][:, trait_col]
-    z = store["zscore"].oindex[hit_rows, :][:, trait_col]
+    beta = store["sig_5e8_beta"][start:end]
+    z = store["sig_5e8_zscore"][start:end]
     return pd.DataFrame({"row": hit_rows, "beta": beta, "z": z})
 
 

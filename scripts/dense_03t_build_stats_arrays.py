@@ -16,15 +16,19 @@ Usage:
     compressor: none | zstd (default: none)
 """
 
+import argparse
 import json
 import shutil
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
-import cyvcf2
 import numpy as np
 import tiledb
+
+BCFTOOLS = "/home/gh13047/miniforge3/envs/bcftools/bin/bcftools"
 
 
 def alid_flip(ref: str, alt: str) -> tuple[str, str, bool]:
@@ -81,7 +85,47 @@ def write_tiledb_array(uri: str, data: np.ndarray) -> None:
         A[:, :] = {"data": data.view(np.uint16)}
 
 
-def main(manifest_path: str, out_dir: str, compressor_name: str = "none") -> None:
+def _fill_col(col_idx: int, vcf_path: str, key_to_row: dict,
+              beta_arr: np.ndarray, zscore_arr: np.ndarray) -> int:
+    """Fill one column of beta_arr/zscore_arr from a single VCF."""
+    cmd = [BCFTOOLS, "query", "-f", "%CHROM\t%POS\t%REF\t%ALT\t[%ES\t%SE]\n", vcf_path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 6:
+            continue
+        chrom, pos_str, ref, alt = parts[0], parts[1], parts[2], parts[3]
+        if "," in alt:
+            continue
+        try:
+            beta = float(parts[4])
+            se = float(parts[5])
+        except ValueError:
+            continue
+        if se == 0.0:
+            continue
+
+        a1, a2, flip = alid_flip(ref, alt)
+        key = (chrom, int(pos_str), a1, a2)
+        row_idx = key_to_row.get(key)
+        if row_idx is None:
+            continue
+
+        z = beta / se
+        if flip:
+            beta = -beta
+            z = -z
+
+        beta_arr[row_idx, col_idx] = beta
+        zscore_arr[row_idx, col_idx] = z
+
+    proc.wait()
+    if proc.returncode != 0:
+        print(f"\nWarning: bcftools failed (exit {proc.returncode}) for {vcf_path}", file=sys.stderr)
+    return col_idx
+
+
+def main(manifest_path: str, out_dir: str, compressor_name: str = "none", workers: int = 1) -> None:
     if compressor_name not in ("none", "zstd"):
         sys.exit(f"Unknown compressor '{compressor_name}': choose none or zstd")
 
@@ -106,53 +150,21 @@ def main(manifest_path: str, out_dir: str, compressor_name: str = "none") -> Non
     }
     n_variants = len(keys)
     n_traits = len(manifest)
-    print(f"  {n_variants:,} variants × {n_traits} traits")
+    print(f"  {n_variants:,} variants × {n_traits} traits  (workers={workers})")
 
-    # Allocate in-memory arrays (NaN = not tested)
     beta_arr = np.full((n_variants, n_traits), np.nan, dtype=np.float16)
     zscore_arr = np.full((n_variants, n_traits), np.nan, dtype=np.float16)
 
-    # Fill arrays trait by trait
-    for col_idx, row in enumerate(manifest):
-        trait_id = row["trait_id"]
-        vcf_path = row["file_path"]
-        print(f"[{col_idx + 1}/{n_traits}] {trait_id}", end="\r", flush=True)
-
-        vcf = cyvcf2.VCF(vcf_path)
-        for variant in vcf:
-            alts = variant.ALT
-            if len(alts) != 1:
-                continue
-            ref = variant.REF
-            alt = alts[0]
-            chrom = variant.CHROM
-            pos = variant.POS
-
-            a1, a2, flip = alid_flip(ref, alt)
-            key = (chrom, pos, a1, a2)
-            row_idx = key_to_row.get(key)
-            if row_idx is None:
-                continue
-
-            es_vals = variant.format("ES")
-            se_vals = variant.format("SE")
-            if es_vals is None or se_vals is None:
-                continue
-
-            beta = float(es_vals[0][0])
-            se = float(se_vals[0][0])
-            if se == 0.0:
-                continue
-            z = beta / se
-
-            if flip:
-                beta = -beta
-                z = -z
-
-            beta_arr[row_idx, col_idx] = beta
-            zscore_arr[row_idx, col_idx] = z
-
-        vcf.close()
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_fill_col, col_idx, row["file_path"], key_to_row, beta_arr, zscore_arr): col_idx
+            for col_idx, row in enumerate(manifest)
+        }
+        for fut in as_completed(futures):
+            fut.result()
+            done += 1
+            print(f"  {done}/{n_traits} traits done", end="\r", flush=True)
 
     print(f"\nCreating TileDB arrays ({compressor_name} compression)...")
 
@@ -199,7 +211,12 @@ def main(manifest_path: str, out_dir: str, compressor_name: str = "none") -> Non
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4):
-        sys.exit(f"Usage: {sys.argv[0]} <manifest.tsv> <output.besdt> [none|zstd]")
-    compressor = sys.argv[3] if len(sys.argv) == 4 else "none"
-    main(sys.argv[1], sys.argv[2], compressor)
+    p = argparse.ArgumentParser()
+    p.add_argument("manifest")
+    p.add_argument("out_dir")
+    p.add_argument("compressor", nargs="?", default="none")
+    p.add_argument("--workers", type=int, default=1)
+    args = p.parse_args()
+    if args.compressor not in ("none", "zstd"):
+        sys.exit(f"Unknown compressor '{args.compressor}': choose none or zstd")
+    main(args.manifest, args.out_dir, args.compressor, args.workers)

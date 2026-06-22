@@ -60,3 +60,11 @@ Built on the BESD format from the [SMR software](https://yanglab.westlake.edu.cn
 ## License
 
 MIT
+
+
+## todo
+
+- Check method for vcf ingestion - slow if not using bcftools?
+- Try different chunking sizes
+- Benchmark for full ukb 2.5k traits
+- create ragged version
