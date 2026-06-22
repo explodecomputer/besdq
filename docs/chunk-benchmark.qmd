@@ -1,0 +1,198 @@
+---
+title: "Chunk Configuration Benchmark"
+subtitle: "chr1 × 1000 UK Biobank traits · `.besdz` Zarr format"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+jupyter: python3
+---
+
+## Overview
+
+The `.besdz` store is a (N_variants × N_traits) float16 Zarr array. Chunk shape
+controls how the matrix is tiled on disk. Every query touches a different
+cross-section of the data:
+
+| Query | Access pattern |
+|---|---|
+| **Regional** | contiguous row range, all traits |
+| **PheWAS** | single row, all traits |
+| **Top-hits** | pre-indexed — reads from sig-index, not main arrays |
+| **Bulk** | all rows, single trait (column) |
+| **Random lookup** | scattered rows × scattered traits |
+
+Tall, full-width chunks (`(rows, n_traits)`) minimise chunk count for row access but
+force loading the entire trait axis for bulk column queries. Short, narrow chunks
+trade those off in the opposite direction. This report quantifies where the
+trade-off lands for five candidate configurations.
+
+Benchmark store: `ukb-chr1-1000.besdz` — 762,488 variants × 1,000 traits,
+uncompressed float16. Queries are run from a temporary rechunked copy so that
+only the chunk geometry changes; data, compressor, and sig-index are identical
+across configurations.
+
+```{python}
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+import pandas as pd
+
+RESULTS_JSON = Path("../data/chunk_benchmark_results.json")
+SCRIPT       = Path("../scripts/dense_chunk_benchmark.py")
+SOURCE_STORE = Path("../data/ukb-chr1-1000.besdz")
+
+# Run the benchmark script if results are not yet cached
+if not RESULTS_JSON.exists():
+    print(f"Results not found — running {SCRIPT.name} …")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--source", str(SOURCE_STORE)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout)
+        raise RuntimeError(f"Benchmark script failed:\n{result.stderr}")
+    print(result.stdout)
+
+results = json.loads(RESULTS_JSON.read_text())
+
+QUERIES = ["regional", "phewas", "tophits", "bulk", "random_lookup"]
+QUERY_LABELS = ["Regional\n(1 Mb window)", "PheWAS\n(1 variant)", "Top-hits\n(sig index)", "Bulk\n(1 trait)", "Random lookup\n(100 var × 10 trait)"]
+CHUNKS = list(results.keys())
+
+print(f"Loaded results for {len(CHUNKS)} chunk configurations × {len(QUERIES)} query types")
+```
+
+## Query Latency
+
+### Summary Table
+
+Median latency in milliseconds. Lower is better.
+
+```{python}
+rows = []
+for chunk in CHUNKS:
+    row = {"Chunk shape": chunk}
+    for q in QUERIES:
+        med = results[chunk][q]["median_ms"]
+        p95 = results[chunk][q]["p95_ms"]
+        row[q] = f"{med:.1f} / {p95:.1f}"
+    rows.append(row)
+
+df = pd.DataFrame(rows).set_index("Chunk shape")
+df.columns = ["Regional", "PheWAS", "Top-hits", "Bulk", "Random"]
+df.index.name = "Chunk shape"
+print("Median / p95 ms")
+df
+```
+
+### Heatmap (median ms, log scale)
+
+Colour encodes log₁₀(median ms). Each cell is annotated with the raw value.
+Note the axes: rows are chunk configurations, columns are query types.
+
+```{python}
+med_matrix = np.array([
+    [results[chunk][q]["median_ms"] for q in QUERIES]
+    for chunk in CHUNKS
+])
+
+fig, ax = plt.subplots(figsize=(9, 3.8))
+
+log_mat = np.log10(np.clip(med_matrix, 0.01, None))
+im = ax.imshow(log_mat, aspect="auto", cmap="RdYlGn_r", vmin=log_mat.min(), vmax=log_mat.max())
+
+ax.set_xticks(range(len(QUERIES)))
+ax.set_xticklabels(QUERY_LABELS, fontsize=9)
+ax.set_yticks(range(len(CHUNKS)))
+ax.set_yticklabels(CHUNKS, fontsize=9, family="monospace")
+
+for i, chunk in enumerate(CHUNKS):
+    for j, q in enumerate(QUERIES):
+        val = med_matrix[i, j]
+        txt = f"{val:.1f}" if val >= 1 else f"{val:.2f}"
+        ax.text(j, i, txt, ha="center", va="center", fontsize=8.5,
+                color="black" if 0.3 < log_mat[i, j] / log_mat.max() < 0.85 else "white")
+
+cb = fig.colorbar(im, ax=ax, pad=0.01)
+cb.set_label("log₁₀(median ms)", fontsize=8)
+
+ax.set_title("Query latency by chunk shape — ukb-chr1-1000.besdz (762,488 × 1,000, float16, no compression)")
+plt.tight_layout()
+plt.show()
+```
+
+### Per-query breakdown
+
+```{python}
+fig, axes = plt.subplots(1, len(QUERIES), figsize=(13, 3.8), sharey=False)
+colors = plt.cm.tab10(np.linspace(0, 0.5, len(CHUNKS)))
+
+for ax, q, qlabel in zip(axes, QUERIES, QUERY_LABELS):
+    medians = [results[chunk][q]["median_ms"] for chunk in CHUNKS]
+    p95s    = [results[chunk][q]["p95_ms"]    for chunk in CHUNKS]
+    errs    = [p - m for m, p in zip(medians, p95s)]
+
+    bars = ax.barh(
+        range(len(CHUNKS)), medians, xerr=errs,
+        color=colors, error_kw={"linewidth": 0.8, "capsize": 3},
+    )
+    ax.set_yticks(range(len(CHUNKS)))
+    ax.set_yticklabels(CHUNKS if ax == axes[0] else [], fontsize=8, family="monospace")
+    ax.set_title(qlabel, fontsize=9)
+    ax.set_xlabel("ms", fontsize=8)
+    ax.tick_params(axis="x", labelsize=8)
+
+    # annotate best
+    best_idx = int(np.argmin(medians))
+    axes[0].get_yticklabels()[best_idx].set_color("#1a7f37") if ax == axes[0] else None
+    bars[best_idx].set_edgecolor("#1a7f37")
+    bars[best_idx].set_linewidth(1.5)
+
+fig.suptitle("Median query latency (bar) + p95 error (whisker) — 10 reps each", fontsize=10)
+plt.tight_layout()
+plt.show()
+```
+
+## Interpretation
+
+```{python}
+# Identify best config per query
+print("Best chunk shape per query (median ms):\n")
+for q, qlabel in zip(QUERIES, QUERY_LABELS):
+    medians = {chunk: results[chunk][q]["median_ms"] for chunk in CHUNKS}
+    best = min(medians, key=medians.get)
+    vals = "  ".join(f"{c}: {v:.1f}" for c, v in medians.items())
+    print(f"  {q:<16}  best={best}   [{vals}]")
+```
+
+The fundamental trade-off is **row access vs column access**:
+
+- Tall, full-width chunks `(*, 1000)` load exactly one chunk per row-group for any
+  row-oriented query (PheWAS, regional, random). A single-row PheWAS read loads one
+  2 MB chunk regardless of how many row-chunks exist; that chunk already contains
+  every trait.
+- Short, narrow chunks `(32768, 16)` flip the trade-off. A bulk single-column read
+  only needs ~24 narrow chunks (32 MB total), but a PheWAS read must open 63 chunks
+  to cover all 1,000 columns — hence the 37 ms latency vs 0.2 ms.
+
+**Top-hits latency** is flat across all configurations because it reads from the
+pre-built sig-index arrays (a separate 1D structure), not the main 2D matrix.
+
+### Recommendation
+
+`(1000, 1000)` — the current default — is the right choice for the typical eQTL /
+GWAS query workload where **regional** and **PheWAS** queries dominate. It is
+within noise of `(512, 1000)` on those queries while using fewer, larger chunks.
+
+`(4096, 128)` is worth considering if single-trait bulk column exports are a
+frequent workload: it reduces bulk latency ~7× (660 ms → 93 ms) at a modest cost
+to PheWAS (~4×, 0.2 ms → 0.8 ms) and is still fast for regional queries (~11 ms).

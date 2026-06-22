@@ -82,6 +82,16 @@
         thresholds (95%, 99%, 99.9%).
       </p>
     </li>
+    <li>
+      <a class="report-title" href="chunk-benchmark.html">Chunk Configuration</a>
+      <p class="desc">
+        <span class="tag">Zarr</span><span class="tag">1000 traits</span>
+        Query latency sensitivity to Zarr chunk shape across five configurations
+        ((512,&nbsp;1000) through (32768,&nbsp;16)). Covers regional, PheWAS,
+        top-hits, bulk, and random-lookup patterns. Informs the choice of default
+        chunk shape for <code>.besdz</code>.
+      </p>
+    </li>
   </ul>
 
   <footer>Generated from <code>docs/</code> — re-render individual <code>.qmd</code> files with <code>quarto render &lt;file&gt;.qmd</code></footer>
