@@ -1,0 +1,3 @@
+# Separate storage layout from association coverage
+
+BESDQ has two primary physical association layouts: Dense matrices for Analyses sharing a variant axis and Ragged sequences for Analyses with differing variant sets. Full versus cis-and-signals data is modelled separately as an association-coverage guarantee, allowing full piecemeal GWAS and filtered molecular QTL data to share the Ragged implementation without obscuring their different completeness semantics. A Dense Reference-Completed release may also include ragged overflow for observed variants outside the reference panel without changing the dense grid into a different primary layout.

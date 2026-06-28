@@ -2,11 +2,107 @@
 
 ## GCST Accession
 
-The EBI GWAS Catalog identifier for a single GWAS-SSF file. In BESDQ's domain, each GCST accession corresponds to exactly one **Trait** (one GWAS-SSF file, one row in `epi`). Multiple GCST accessions are grouped under a single PubMed ID (study batch).
+The EBI GWAS Catalog identifier for a single GWAS-SSF file. In BESDQ's domain, each GCST accession identifies exactly one **Analysis**. Multiple GCST accessions may be grouped into a **Study Batch**.
+
+## Analysis
+
+A particular statistical analysis of one **Trait**, producing associations between that trait and a set of variants. The same trait may have multiple analyses that differ by cohort, ancestry, model, sample subset, or meta-analysis.
 
 ## Study Batch
 
 A set of GCST accessions sharing a PubMed ID. The natural unit of bulk ingestion. Intermediate files from Stage 1 are grouped in a subdirectory named by PMID (or a user-supplied project name).
+
+## BESDQ Store
+
+A self-contained logical distribution unit containing one or more **Analyses** and everything required to interpret and query them. A Store has a stable identity, follows the common BESDQ contract, and has a **Primary Storage Layout**.
+
+## Store Release
+
+An immutable, self-identifying published version of a **BESDQ Store**. Each release records its Store identity, release identity, format version, creation time, and provenance so that downloaded or mirrored copies remain interpretable without a catalogue service.
+
+## Format Version
+
+The version of the BESDQ storage contract required to interpret a **Store Release**. It describes compatibility of the representation, not the version of the data contained in the Store.
+
+## Primary Storage Layout
+
+The main physical organisation of associations within a **BESDQ Store**. Dense and Ragged are alternative primary layouts behind the same metadata, identity, validation, and query concepts; layout is independent of **Association Coverage**.
+
+## Dense Layout
+
+A **Primary Storage Layout** in which Analyses share a variant axis and associations occupy cells in a variant-by-Analysis matrix. An explicit missing value represents an unavailable association.
+
+For Reference-Completed Dense stores, the dense variant axis is the **Reference Variant Set**; observed off-panel variants are retained in **Ragged Overflow**.
+
+## Ragged Layout
+
+A **Primary Storage Layout** in which each Analysis has its own sequence of retained associations referencing a Store-wide variant table. Different Analyses may retain different variant sets.
+
+In Reference-Completed Ragged stores, observed, imputed, and missing reference variants for a completed region belong to the same Analysis association sequence and are distinguished by **Association Status**.
+
+## Ragged Overflow
+
+An optional ragged component of a Dense Reference-Completed **Store Release** that preserves observed associations outside the **Reference Variant Set**. The dense component remains the primary query grid.
+
+## Query Component
+
+The part of a multi-component Store Release from which a returned association was read, such as Dense Grid or Ragged Overflow. Off-panel observed variants inside a Ragged primary layout's completed region are ordinary observed associations, not a separate Query Component.
+
+## Association Coverage
+
+The guarantee a **Store Release** makes about which source associations it retains, independently of its **Storage Layout**. Full Coverage retains every usable source association after normalisation and quality control; Cis-and-Signals Coverage retains complete cis regions plus selected significant and suggestive trans associations.
+
+## Completion State
+
+Whether a **Store Release** contains only source-observed associations or has also been completed against a reference variant set. Observed-Only and Reference-Completed releases share the same query concepts but differ in whether imputed associations may be present.
+
+## LD Reference Panel
+
+The declared ancestry-specific LD resource used for reference completion. It defines the **Reference Variant Set** and provides the LD information used to infer imputed associations.
+
+## Reference Variant Set
+
+The canonical variant set defined by an **LD Reference Panel** for a **Reference-Completed** release. Reference completion attempts to provide associations on this set, subject to missingness where imputation fails or is out of scope.
+
+## Reference Panel Membership
+
+Store variant metadata indicating whether a variant belongs to the **Reference Variant Set** for a Reference-Completed release. It distinguishes reference-panel variants from observed off-panel variants.
+
+## Reference Completion Region
+
+A genomic interval within which a Ragged Cis-and-Signals Store attempts reference completion. A completed region contains every **Reference Variant Set** variant inside its boundary plus observed off-panel variants in the same boundary; singleton suggestive associations are not expanded.
+
+## Reference Completion Method
+
+The release-level algorithm and parameters used to infer imputed Z and SE values from observed associations and the **LD Reference Panel**. It is recorded as provenance for a Reference-Completed release rather than repeated per association.
+
+## Reference Completion Quality
+
+A quality summary for imputed associations at LD-block-by-Analysis granularity. It describes confidence in a block of imputed values rather than attaching separate quality metadata to every association.
+
+## Observed Association
+
+An association whose statistics come from the source dataset after BESDQ normalisation. Observed associations are the authoritative basis for a Store Release.
+
+## Imputed Association
+
+An association whose Z and SE were inferred during reference completion rather than reported by the source dataset. Imputed associations must remain distinguishable from observed associations.
+
+## Association Status
+
+The origin state of an association in a Reference-Completed **Store Release**: Missing, Observed, or Imputed. Missing means the association was not observed and reference completion did not impute it.
+
+## Observed-Only Query
+
+A query mode that excludes **Imputed Associations** and returns only source-observed results. Reference-Completed releases include imputed associations by default, but callers may request observed-only results.
+
+## Top-Hit Query
+
+A query that returns associations ranked by statistical significance. Dense, Ragged, Ragged Overflow, observed, and imputed results have equal priority; ranking is determined by significance, not by storage component or association status.
+
+## Top-Hit Index
+
+A layout-specific acceleration structure that supports **Top-Hit Queries** using the Store's shared significance thresholds and result contract. Dense and Ragged components may encode the index differently but expose the same query semantics.
 
 ## Two-Stage Build
 
@@ -38,7 +134,7 @@ The `discover-study` command. Given a PubMed ID, queries the EBI GWAS Catalog AP
 
 ## Trait
 
-A molecular phenotype being measured — e.g. gene expression of IL10, a CpG methylation level, a protein abundance. The generalisation of "probe" (the BESD binary format's term). Each BESDQ dataset contains one or more traits, each with its own row in the `epi` table and its own statistics block in `probe_data`.
+A measured or derived outcome, such as disease status, LDL cholesterol, gene expression, methylation, or protein abundance. **Phenotype** is a synonym, but BESDQ uses Trait consistently; one Trait may be the subject of multiple **Analyses**.
 
 **EPI columns by class:**
 
@@ -56,62 +152,67 @@ Study-level metadata (publication, year, ancestry, max sample size, study type, 
 
 > **Probe** in the BESD binary format is the historical synonym for Trait. The `.epi` file, `probe_data` table, and binary block structure still use "probe" internally.
 
-## SNP Identity and Allele Convention
+## Variant Identity and Allele Convention
 
-The canonical SNP key is `chr:pos:A1:A2` where **A1 is always the alphabetically first allele** and A2 is the other. This convention is shared with pleioDB and makes cross-dataset matching on `chr_pos_a1_a2` immediately interpretable without allele harmonisation.
+The canonical within-Store variant key is the ALID `chr:pos:A1:A2`, where **A1 is always the alphabetically first allele** and A2 is the other. Cross-Store identity is the pair (**Reference Assembly**, ALID); the rsid is an alias rather than primary identity, and variants without an rsid remain valid.
 
-At import time, every SNP-trait association is normalised: if the source file's effect allele is not alphabetically first, the alleles are swapped and the beta (and z-score) is negated. This happens unconditionally for all sources (GWAS-SSF, BESD, any future format).
+Every variant-Analysis association is normalised to this orientation: if the source effect allele is not alphabetically first, the alleles are swapped and signed statistics are negated.
 
-ESI deduplication uses `chr:pos:A1:A2` as the unique SNP key. The rsid is stored as a lookup field (`snp_id`) but is not the primary key. Novel imputed variants without an rsid are stored with `snp_id = NULL`.
+Multiple canonical variants may share a genomic position when their allele pairs differ. A multiallelic source record is decomposed when it provides unambiguous per-allele association statistics; an ambiguous record does not define a canonical association.
+
+Alleles are trimmed and left-aligned against the Store's **Reference Assembly** before identity is assigned. A long-allele ALID may use a deterministic hash as its compact representation, but the complete normalised alleles remain authoritative and are retained by the Store.
+
+## Store Variant Table
+
+The Store-wide union of canonical variants referenced by its **Analyses**. Each variant occurs once in a **Store Release**, independently of how many Analyses report it.
+
+## Variant Index
+
+A compact Store-local reference to a row in the **Store Variant Table**. It has no identity or stability guarantee outside its Store Release; cross-Store matching uses canonical variant identity instead.
+
+## Reference Assembly
+
+The genome assembly to which every variant coordinate in a **Store Release** refers, such as GRCh37 or GRCh38. Each Store Release declares exactly one Reference Assembly; coordinate conversion occurs before ingestion and is part of provenance.
 
 ## Statistics Encoding
 
-The representation used in `probe_data` BLOBs. Two modes, selected by data source:
-
-**VectorN mode** (default for GWAS-SSF and any source that provides SE directly): stores `zscores` (float16) + `se_vector` (float16, SE in original study units) per SNP-trait pair. No AF or n needed at query time. SE is stored in original units and divided by `sd_y = sqrt(trait_var)` at query time to produce SD-unit output.
-
-**ScalarN mode** (legacy BESD imports): stores `zscores` (float16) per pair + `n_scalar INTEGER` per trait. SE is reconstructed from n, AF, and trait_var. SD-unit SE simplifies to `1 / sqrt(n × 2 × AF × (1−AF))` — trait_var cancels.
-
-**`probe_data` schema:**
-- `zscores BLOB` — float16 numpy array, always present
-- `se_vector BLOB` — float16 numpy array, VectorN only (NULL in ScalarN)
-- `n_scalar INTEGER` — ScalarN only (NULL in VectorN)
-
-**`epi` schema:** mandatory `trait_id TEXT`, `trait_name TEXT`; optional functional `trait_var REAL`, `trait_chr TEXT`, `trait_bp INTEGER`; optional non-consequential `gene TEXT`, `context TEXT`.
-
-**`esi` schema:** `freq` column populated during build if absent in source (derived from beta, se, user-supplied n in ScalarN mode).
+The logical association statistics stored by a BESDQ Store. New Dense and Ragged Stores store Z and SE for each retained association; beta is derived from those statistics on the same **Stored Effect Scale**.
 
 ## Z-Score
 
-`z = beta / se`. The primary stored statistic in the Lean Index. Stored as float16 (sufficient precision for eQTL z-scores, which rarely exceed ±40).
+`z = beta / se`. Z is signed, carries effect direction, and is invariant to simple rescaling of beta and SE.
+
+## Standard Error
+
+The non-negative uncertainty of beta on the same **Stored Effect Scale**. New Dense and Ragged Stores store SE directly rather than reconstructing it from allele frequency, sample size, or beta divided by Z.
 
 ## Reconstruction
 
-The process of deriving output beta and se from stored quantities at query time. Default output is **SD units** (see Output Scale). Two paths:
+The process of deriving query output from stored association statistics. New Dense and Ragged Stores return Z and SE directly and derive beta as Z multiplied by SE when beta is requested.
 
-**VectorN path** (GWAS-SSF imports):
-```
-se_out  = se_stored / sd_y        # sd_y = sqrt(trait_var) from EPI
-beta_out = z × se_out
-```
-Requires: z (stored), se_stored (stored), sd_y from EPI `trait_var`.
+## Sample Size
 
-**ScalarN path** (legacy BESD imports):
-```
-se_orig = sqrt(trait_var / (n × 2 × AF × (1 − AF)))
-se_out  = se_orig / sd_y = 1 / sqrt(n × 2 × AF × (1 − AF))   # trait_var cancels
-beta_out = z × se_out
-```
-Requires: z (stored), n (stored), AF (stored in ESI). `trait_var` cancels — SD-unit SE is independent of phenotype scale.
+The source-reported number or effective number of participants contributing to an **Analysis** or to one of its variant associations. Its meaning is described by **Sample Size Kind** and its granularity by **Sample Size Scope**; BESDQ does not present a value inferred from effect statistics as an observed participant count.
 
-With `--original-scale`: `se_out = se_stored` (VectorN) or `se_out = se_orig` (ScalarN); no division by sd_y.
+## Sample Size Kind
 
-## N (Sample Size)
+The interpretation of a **Sample Size**: Participants, Case-Control, Effective, or Unknown. Case-Control distinguishes case and control counts; Effective is explicitly not an observed participant count.
 
-The number of individuals used to compute each association.
+## Sample Size Scope
 
-- **ScalarN mode**: n is constant across all SNPs for a trait (typical single-cohort BESD eQTL datasets). Stored once per trait in `probe_data` as `n_scalar INTEGER`. Supplied by the user via `--sample-size N` or read from YAML.
-- **VectorN mode**: SE is stored directly per SNP-trait pair (GWAS-SSF imports and any source that provides SE). n is not stored. `se_vector BLOB` (float16) aligned to `snp_indices`.
+Where a **Sample Size** applies: Analysis when one value applies throughout, Variant when values may differ between associations, or None when sample size is unknown.
+
+## Stored Effect Scale
+
+The controlled scale in which an **Analysis** stores beta and SE: SD Units for continuous traits, Log Odds for binary traits, or Log Hazard for survival traits.
+
+## Original Effect Scale
+
+The source-reported or source-measurement scale of beta before BESDQ normalisation, such as kg/m², mmol/L, log-odds, or source-specific free text. BESDQ records this as provenance rather than forcing it into a strict ontology.
+
+## Phenotype Standard Deviation
+
+The Analysis-level scale factor used to convert linear continuous effects from **Original Effect Scale** to phenotype standard deviation units. Its value and provenance are part of Analysis metadata when the conversion is meaningful.
 
 ## Trait Variance (trait_var)
 
@@ -131,15 +232,21 @@ All query methods return beta and SE in **SD units** (standard deviation of the 
 
 SD-unit conversion: `beta_sd = beta_orig / sd_y`, `se_sd = se_orig / sd_y`, where `sd_y = sqrt(trait_var)` from EPI. The z-score and p-value are invariant — they are identical in both scales.
 
-## Allele Frequency (AF)
+## Effect Allele Frequency
 
-Minor allele frequency of a SNP, used in reconstruction. Sourced from the `.esi` file (column 7, optional). When AF is absent from ESI and ScalarN mode is used, AF is derived per SNP during build via:
+The frequency of the effect allele associated with an association. For observed associations EAF comes from the source dataset when available; for imputed associations EAF comes from the **LD Reference Panel** when stored.
 
-```
-AF = (1 − sqrt(1 − 2 × var_y / (n × se²))) / 2
-```
+## EAF Scope
 
-and written into the ESI table of the Lean Index.
+Where an **Effect Allele Frequency** value applies: Variant when one value is shared for a Store variant, Association when values may differ by Analysis-variant association, or Absent when EAF is not stored.
+
+## Imputation INFO
+
+The source-reported imputation quality or information score for a variant association. INFO is optional association metadata and is not required to reconstruct beta, SE, Z, or p-value in new BESDQ Stores.
+
+## INFO Scope
+
+Where an **Imputation INFO** value applies: Variant when one value is shared for a Store variant, Association when values may differ by Analysis-variant association, or Absent when INFO is not stored.
 
 ## Significance Mask
 
@@ -177,15 +284,15 @@ Same ALID convention as the Lean Index: canonical key is `chr:pos:A1:A2` where *
 
 Built as the **union** of all variants across all traits in a batch. Variants absent from a given trait are encoded as float16 NaN in the stats arrays (no separate missingness mask). This accommodates traits with MAC filters or rare-disease exclusions, which can have substantial missingness relative to the batch-wide variant list.
 
-EAF is averaged across all traits that tested each variant, computed in the same pass as the union variant collection. INFO score is taken from the reference file (the trait with the most variants).
+EAF follows the Store's **EAF Scope**. Dense stores may use Variant or Association scope; Ragged stores use Association scope because each Analysis has its own retained association sequence.
 
 ### Stats Arrays
 
-Two separate Zarr arrays per store: `beta` and `zscore`, both shape `(N_variants, N_traits)`, dtype float16. SE is not stored — reconstructed at query time as `beta / zscore`. P-value is derived from Z. Separate arrays allow queries that only need Z (PheWAS, top-hits) to skip loading beta.
+Two separate Zarr arrays per Dense store: `se` and `zscore`, both shape `(N_variants, N_analyses)`. Beta is not stored — derived at query time from Z and SE. P-value is derived from Z. Separate arrays allow queries that only need Z to skip loading SE.
 
 ### Effect Scale
 
-Stored in **original study units** — whatever units appear in the source files. No SD-unit normalisation (no `trait_var` division). SE reconstruction `SE = beta / Z` stays in original units. This keeps the prototype simple and makes round-trip comparison to source VCFs direct.
+Beta is derived on the **Stored Effect Scale**. For continuous traits this is normally phenotype standard deviation units; for binary and survival traits this is normally the model-native scale such as log-odds or log-hazard. The **Original Effect Scale** is retained as provenance rather than used as the primary storage scale.
 
 ### Sample Size N
 
@@ -201,7 +308,7 @@ The prototype is implemented as **standalone scripts or a notebook**, with no in
 
 ### Significance Index (Dense Format)
 
-A query-acceleration structure stored **in-place inside a `.besdz` store**, alongside `beta` and `zscore`. Not to be confused with the Lean Index [Significance Mask](#significance-mask), which is an import-time filter that determines what gets stored; the Significance Index is a pre-computed lookup table over already-stored data.
+A query-acceleration structure stored **in-place inside a `.besdz` store**, alongside `se` and `zscore`. Not to be confused with the Lean Index [Significance Mask](#significance-mask), which is an import-time filter that determines what gets stored; the Significance Index is a pre-computed lookup table over already-stored data.
 
 Three p-value thresholds: 5×10⁻⁸ (genome-wide significant), 5×10⁻⁶, 5×10⁻⁴.
 
@@ -215,7 +322,7 @@ P-values are derived from stored Z-scores: `p = 2 × (1 − Φ(|Z|))`. Variants 
 **Tophits query** with index (vs naive full-column scan):
 1. Load `sig_{key}_offsets[t:t+2]` — two int64 values
 2. Slice `sig_{key}[start:end]` — the hit row indices for trait t
-3. Fancy-index `beta` and `zscore` at those rows — only the chunks containing hits are read
+3. Fancy-index `se` and `zscore` at those rows — only the chunks containing hits are read
 
 The index is built by a standalone script (`dense_11_build_sig_index.py`) and can be updated independently of the stats arrays.
 
